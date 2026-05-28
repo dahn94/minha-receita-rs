@@ -71,3 +71,52 @@ pub fn normalize_cnpj(s: &str) -> Result<String> {
 fn sanitize(s: &str) -> String {
     s.replace('\'', "''")
 }
+
+#[derive(Debug, Default, Clone)]
+pub struct SearchParams {
+    pub uf: Option<String>,
+    pub cnae: Option<String>,
+    pub bairro: Option<String>,
+    pub municipio: Option<String>,
+    pub natureza: Option<String>,
+    pub situacao: Option<String>,
+    pub limit: usize,
+    pub page: usize,
+}
+
+impl DataContext {
+    pub async fn search(&self, p: &SearchParams) -> Result<Vec<RecordBatch>> {
+        let mut where_clauses: Vec<String> = Vec::new();
+        if let Some(v) = &p.uf {
+            where_clauses.push(format!("uf = '{}'", sanitize(v)));
+        }
+        if let Some(v) = &p.cnae {
+            where_clauses.push(format!("cnae_fiscal.codigo = '{}'", sanitize(v)));
+        }
+        if let Some(v) = &p.bairro {
+            where_clauses.push(format!("endereco.bairro = '{}'", sanitize(v)));
+        }
+        if let Some(v) = &p.municipio {
+            where_clauses.push(format!("municipio.codigo = '{}'", sanitize(v)));
+        }
+        if let Some(v) = &p.natureza {
+            where_clauses.push(format!("natureza_juridica.codigo = '{}'", sanitize(v)));
+        }
+        if let Some(v) = &p.situacao {
+            where_clauses.push(format!("situacao_cadastral = '{}'", sanitize(v)));
+        }
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_clauses.join(" AND "))
+        };
+        let limit = p.limit.max(1).min(100);
+        let offset = limit.saturating_mul(p.page.max(1).saturating_sub(1));
+        let sql = format!(
+            "SELECT * FROM companies{} LIMIT {} OFFSET {}",
+            where_sql, limit, offset
+        );
+        let df = self.ctx.sql(&sql).await?;
+        Ok(df.collect().await?)
+    }
+}
