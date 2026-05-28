@@ -4,6 +4,34 @@ use std::path::Path;
 
 use crate::Result;
 
+pub fn classify(name: &str) -> Option<&'static str> {
+    let upper = name.to_uppercase();
+    let stem: &str = std::path::Path::new(&upper)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&upper);
+    let kinds = [
+        ("empresas", &["EMPRECSV", "EMPRESAS"][..]),
+        ("estabelecimentos", &["ESTABELE", "ESTABELECIMENTOS"][..]),
+        ("socios", &["SOCIOCSV", "SOCIOS"][..]),
+        ("simples", &["SIMPLES.CSV", "SIMPLES"][..]),
+        ("cnaes", &["CNAECSV", "CNAES"][..]),
+        ("motivos", &["MOTICSV", "MOTIVOS"][..]),
+        ("municipios", &["MUNICCSV", "MUNICIPIOS"][..]),
+        ("naturezas", &["NATJUCSV", "NATUREZAS"][..]),
+        ("paises", &["PAISCSV", "PAISES"][..]),
+        ("qualificacoes", &["QUALSCSV", "QUALIFICACOES"][..]),
+    ];
+    for (kind, patterns) in &kinds {
+        for p in *patterns {
+            if stem.contains(p) {
+                return Some(kind);
+            }
+        }
+    }
+    None
+}
+
 pub fn extract_zip_to_dir(zip_path: &Path, out_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
     let file = File::open(zip_path)?;
@@ -83,5 +111,34 @@ mod tests {
 
         assert!(out.join("a.csv").exists());
         assert!(out.join("b.csv").exists());
+    }
+
+    #[test]
+    fn classifies_real_receita_names() {
+        assert_eq!(classify("K3241.K03200Y0.D10110.EMPRECSV"), Some("empresas"));
+        assert_eq!(classify("K3241.K03200Y0.D10110.ESTABELE"), Some("estabelecimentos"));
+        assert_eq!(classify("K3241.K03200Y0.D10110.SOCIOCSV"), Some("socios"));
+        assert_eq!(classify("F.K03200$Z.D10110.CNAECSV"), Some("cnaes"));
+        assert_eq!(classify("F.K03200$Z.D10110.MUNICCSV"), Some("municipios"));
+        assert_eq!(classify("F.K03200$Z.D10110.NATJUCSV"), Some("naturezas"));
+        assert_eq!(classify("F.K03200$Z.D10110.PAISCSV"), Some("paises"));
+        assert_eq!(classify("F.K03200$Z.D10110.MOTICSV"), Some("motivos"));
+        assert_eq!(classify("F.K03200$Z.D10110.QUALSCSV"), Some("qualificacoes"));
+        assert_eq!(classify("D10110.SIMPLES.CSV.D10110"), Some("simples"));
+        assert_eq!(classify("ignore.txt"), None);
+    }
+
+    #[test]
+    fn classifies_test_friendly_names() {
+        assert_eq!(classify("Empresas0"), Some("empresas"));
+        assert_eq!(classify("Estabelecimentos0"), Some("estabelecimentos"));
+        assert_eq!(classify("Socios0"), Some("socios"));
+        assert_eq!(classify("Cnaes"), Some("cnaes"));
+        assert_eq!(classify("Municipios"), Some("municipios"));
+        assert_eq!(classify("Naturezas"), Some("naturezas"));
+        assert_eq!(classify("Paises"), Some("paises"));
+        assert_eq!(classify("Motivos"), Some("motivos"));
+        assert_eq!(classify("Qualificacoes"), Some("qualificacoes"));
+        assert_eq!(classify("Simples"), Some("simples"));
     }
 }
