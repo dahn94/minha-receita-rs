@@ -1,6 +1,35 @@
+use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+
+use crate::{Error, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Period {
+    pub year: u16,
+    pub month: u8,
+}
+
+impl FromStr for Period {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        let (y, m) = s.split_once('-').ok_or_else(|| Error::InvalidPeriod(s.into()))?;
+        let year: u16 = y.parse().map_err(|_| Error::InvalidPeriod(s.into()))?;
+        let month: u8 = m.parse().map_err(|_| Error::InvalidPeriod(s.into()))?;
+        if !(1..=12).contains(&month) {
+            return Err(Error::InvalidPeriod(s.into()));
+        }
+        Ok(Period { year, month })
+    }
+}
+
+impl fmt::Display for Period {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:04}-{:02}", self.year, self.month)
+    }
+}
 
 fn codigo_descricao() -> DataType {
     DataType::Struct(Fields::from(vec![
@@ -141,5 +170,28 @@ mod tests {
             },
             other => panic!("expected list, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn period_parses_yyyy_mm() {
+        let p: Period = "2026-05".parse().unwrap();
+        assert_eq!(p.year, 2026);
+        assert_eq!(p.month, 5);
+        assert_eq!(p.to_string(), "2026-05");
+    }
+
+    #[test]
+    fn period_rejects_garbage() {
+        assert!("nope".parse::<Period>().is_err());
+        assert!("2026/05".parse::<Period>().is_err());
+        assert!("2026-13".parse::<Period>().is_err());
+        assert!("2026-00".parse::<Period>().is_err());
+    }
+
+    #[test]
+    fn period_ordering() {
+        let a: Period = "2026-04".parse().unwrap();
+        let b: Period = "2026-05".parse().unwrap();
+        assert!(a < b);
     }
 }
