@@ -1,8 +1,6 @@
 use std::io::Write;
-use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{Array, RecordBatch};
 use comfy_table::{ContentArrangement, Table};
 
 use crate::Result;
@@ -83,6 +81,10 @@ fn format_cell(array: &dyn Array, row: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     fn sample_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
