@@ -4,6 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::listing::ListingOptions;
+use datafusion::prelude::*;
 
 use crate::Result;
 
@@ -86,6 +89,27 @@ pub fn raw_schema(kind: &str) -> Option<SchemaRef> {
         _ => return None,
     };
     Some(Arc::new(schema))
+}
+
+pub async fn register_sources(ctx: &SessionContext, staging: &Path) -> Result<()> {
+    for kind in [
+        "empresas", "estabelecimentos", "socios", "simples",
+        "cnaes", "motivos", "naturezas", "paises", "qualificacoes", "municipios",
+    ] {
+        let dir = staging.join(kind);
+        if !dir.exists() {
+            continue;
+        }
+        let schema = raw_schema(kind).expect("known kind");
+        let fmt = CsvFormat::default()
+            .with_has_header(false)
+            .with_delimiter(b';');
+        let opts = ListingOptions::new(Arc::new(fmt))
+            .with_file_extension(".csv");
+        ctx.register_listing_table(kind, dir.to_str().unwrap(), opts, Some(schema), None)
+            .await?;
+    }
+    Ok(())
 }
 
 pub fn classify(name: &str) -> Option<&'static str> {
@@ -260,6 +284,21 @@ mod tests {
         assert!(staging.join("empresas").join("Empresas1.csv").exists());
         assert!(staging.join("cnaes").join("Cnaes.csv").exists());
         assert!(!staging.join("ignore.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn register_sources_makes_them_queryable() {
+        let td = tempfile::TempDir::new().unwrap();
+        let staging = td.path().join("staging").join("cnaes");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("Cnaes.csv"), "0111-3/01;Cultivo de arroz\n0111-3/02;Cultivo de milho\n").unwrap();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        register_sources(&ctx, td.path().join("staging").as_path()).await.unwrap();
+        let df = ctx.sql("SELECT COUNT(*) as n FROM cnaes").await.unwrap();
+        let b = df.collect().await.unwrap();
+        let n = b[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
+        assert_eq!(n, 2);
     }
 
     #[test]
