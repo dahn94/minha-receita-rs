@@ -14,6 +14,15 @@ pub fn parse_period_listing(html: &str) -> Vec<Period> {
         .collect()
 }
 
+pub fn parse_file_listing(html: &str) -> Vec<String> {
+    let doc = Html::parse_document(html);
+    let sel = Selector::parse("a").unwrap();
+    doc.select(&sel)
+        .filter_map(|a| a.value().attr("href").map(|s| s.to_string()))
+        .filter(|s| s.ends_with(".zip"))
+        .collect()
+}
+
 pub fn latest_period(html: &str) -> Result<Period> {
     parse_period_listing(html)
         .into_iter()
@@ -48,5 +57,23 @@ mod tests {
         let periods = parse_period_listing(html);
         assert_eq!(periods.len(), 1);
         assert_eq!(periods[0].to_string(), "2026-05");
+    }
+
+    const FILES_SAMPLE: &str = r#"
+<html><body>
+<a href="Empresas0.zip">Empresas0.zip</a>
+<a href="Estabelecimentos0.zip">Estabelecimentos0.zip</a>
+<a href="Socios0.zip">Socios0.zip</a>
+<a href="Cnaes.zip">Cnaes.zip</a>
+<a href="../">../</a>
+</body></html>
+"#;
+
+    #[test]
+    fn parses_zip_anchors() {
+        let names = parse_file_listing(FILES_SAMPLE);
+        assert!(names.iter().any(|n| n == "Empresas0.zip"));
+        assert!(names.iter().any(|n| n == "Cnaes.zip"));
+        assert!(!names.iter().any(|n| n == "../"));
     }
 }
