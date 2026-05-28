@@ -45,6 +45,37 @@ pub async fn init_from_local(
     Ok(())
 }
 
+pub fn read_local_period(root: &Path) -> Result<Period> {
+    let s = std::fs::read_to_string(root.join(".period"))
+        .map_err(|_| Error::MissingData(format!("{}/.period", root.display())))?;
+    s.trim().parse()
+}
+
+#[derive(Debug)]
+pub enum UpdateOutcome {
+    UpToDate(Period),
+    Updated { from: Period, to: Period },
+}
+
+pub async fn update(root: &Path, concurrency: usize) -> Result<UpdateOutcome> {
+    use crate::download::{RECEITA_BASE_URL, fetch_latest_period};
+    let client = reqwest::Client::builder()
+        .user_agent("minha-receita-rs/0.1")
+        .build()?;
+    let local = read_local_period(root)?;
+    let remote = fetch_latest_period(&client, RECEITA_BASE_URL).await?;
+    if local >= remote {
+        return Ok(UpdateOutcome::UpToDate(local));
+    }
+    // Wipe old `companies/` (will be rewritten); leave `zips/` to be overwritten.
+    let companies = root.join("companies");
+    if companies.exists() {
+        std::fs::remove_dir_all(&companies)?;
+    }
+    init(root, Some(remote.to_string()), concurrency).await?;
+    Ok(UpdateOutcome::Updated { from: local, to: remote })
+}
+
 pub async fn init(root: &Path, period_override: Option<String>, concurrency: usize) -> Result<()> {
     use crate::download::{
         RECEITA_BASE_URL, discover_and_download, fetch_ibge_url, download_file,
