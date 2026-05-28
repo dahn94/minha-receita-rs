@@ -222,6 +222,192 @@ pub fn extract_all(zip_dir: &Path, out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Single SQL that joins all raw tables and produces one row per estabelecimento
+/// with `qsa` and `cnaes_secundarios` as arrays of structs.
+///
+/// Deviations from the original plan (DataFusion 44 compatibility):
+/// - Date parsing uses `to_date(s, '%Y%m%d')` (chrono strftime), wrapped in a
+///   CASE that returns NULL for empty / "00000000" inputs. DF 44 has no
+///   `try_to_date` and a literal `'yyyyMMdd'` is rejected by `to_date`.
+/// - The `flatten()` around `string_to_array(...)` was dropped — the function
+///   already returns a 1-D list.
+/// - The `cnaes_secundarios` CTE no longer uses correlated
+///   `FROM r, UNNEST(r.codigos) u(code)` (DF 44 plans that as an outer
+///   reference and bails out at physical planning). Instead `unnest(...)`
+///   is used as a scalar projection inside a single CTE, which DataFusion
+///   rewrites into a logical Unnest node it can execute.
+/// - Boolean coercions (`= 'S'`) became full CASE expressions to keep NULLs
+///   distinct from `false`.
+/// - `array_remove(make_array(...), NULL)` replaces the original
+///   `array[..]` literal syntax (DF 44 prefers `make_array`).
+pub const CONSOLIDATION_SQL: &str = r#"
+WITH
+socios_agg AS (
+    SELECT
+        s.cnpj_basico,
+        array_agg(named_struct(
+            'identificador_de_socio', try_cast(s.identificador_de_socio AS INT),
+            'nome_socio', s.nome_socio,
+            'cnpj_cpf_do_socio', s.cnpj_cpf_do_socio,
+            'codigo_qualificacao_socio', try_cast(s.codigo_qualificacao_socio AS INT),
+            'qualificacao_socio', qs.descricao,
+            'data_entrada_sociedade', CASE
+                WHEN s.data_entrada_sociedade_raw IS NULL
+                  OR length(s.data_entrada_sociedade_raw) = 0
+                  OR s.data_entrada_sociedade_raw = '00000000'
+                THEN NULL
+                ELSE to_date(s.data_entrada_sociedade_raw, '%Y%m%d')
+            END,
+            'codigo_pais', s.codigo_pais,
+            'pais', ps.descricao,
+            'cpf_representante_legal', s.cpf_representante_legal,
+            'nome_representante_legal', s.nome_representante_legal,
+            'codigo_qualificacao_representante_legal', try_cast(s.codigo_qualificacao_representante_legal AS INT),
+            'qualificacao_representante_legal', qrl.descricao,
+            'codigo_faixa_etaria', try_cast(s.codigo_faixa_etaria AS INT)
+        )) AS qsa
+    FROM socios s
+    LEFT JOIN qualificacoes qs ON qs.codigo = s.codigo_qualificacao_socio
+    LEFT JOIN qualificacoes qrl ON qrl.codigo = s.codigo_qualificacao_representante_legal
+    LEFT JOIN paises ps ON ps.codigo = s.codigo_pais
+    GROUP BY s.cnpj_basico
+),
+cnaes_sec_exploded AS (
+    SELECT
+        concat(est.cnpj_basico, est.cnpj_ordem, est.cnpj_dv) AS cnpj,
+        unnest(string_to_array(est.cnae_fiscal_secundaria, ',')) AS code
+    FROM estabelecimentos est
+    WHERE est.cnae_fiscal_secundaria IS NOT NULL
+      AND length(est.cnae_fiscal_secundaria) > 0
+),
+cnaes_sec_resolved AS (
+    SELECT
+        e.cnpj,
+        array_agg(named_struct('codigo', c.codigo, 'descricao', c.descricao)) AS cnaes_secundarios
+    FROM cnaes_sec_exploded e
+    LEFT JOIN cnaes c ON c.codigo = e.code
+    GROUP BY e.cnpj
+)
+SELECT
+    concat(est.cnpj_basico, est.cnpj_ordem, est.cnpj_dv) AS cnpj,
+    est.cnpj_basico AS cnpj_raiz,
+    emp.razao_social,
+    est.nome_fantasia,
+    CASE est.situacao_cadastral_codigo
+        WHEN '01' THEN 'NULA'
+        WHEN '02' THEN 'ATIVA'
+        WHEN '03' THEN 'SUSPENSA'
+        WHEN '04' THEN 'INAPTA'
+        WHEN '08' THEN 'BAIXADA'
+        ELSE est.situacao_cadastral_codigo
+    END AS situacao_cadastral,
+    CASE
+        WHEN est.data_situacao_cadastral_raw IS NULL
+          OR length(est.data_situacao_cadastral_raw) = 0
+          OR est.data_situacao_cadastral_raw = '00000000'
+        THEN NULL
+        ELSE to_date(est.data_situacao_cadastral_raw, '%Y%m%d')
+    END AS data_situacao_cadastral,
+    named_struct('codigo', est.motivo_situacao_cadastral, 'descricao', mot.descricao) AS motivo_situacao_cadastral,
+    CASE
+        WHEN est.data_inicio_atividade_raw IS NULL
+          OR length(est.data_inicio_atividade_raw) = 0
+          OR est.data_inicio_atividade_raw = '00000000'
+        THEN NULL
+        ELSE to_date(est.data_inicio_atividade_raw, '%Y%m%d')
+    END AS data_inicio_atividade,
+    named_struct('codigo', est.cnae_fiscal_principal, 'descricao', cf.descricao) AS cnae_fiscal,
+    csr.cnaes_secundarios,
+    named_struct('codigo', emp.natureza_juridica, 'descricao', nat.descricao) AS natureza_juridica,
+    named_struct('codigo', emp.qualificacao_responsavel, 'descricao', qr.descricao) AS qualificacao_responsavel,
+    try_cast(replace(emp.capital_social_raw, ',', '.') AS DOUBLE) AS capital_social,
+    named_struct(
+        'codigo', emp.porte,
+        'descricao', CASE emp.porte
+            WHEN '01' THEN 'NAO INFORMADO'
+            WHEN '03' THEN 'MICRO EMPRESA'
+            WHEN '05' THEN 'EMPRESA DE PEQUENO PORTE'
+            ELSE 'DEMAIS'
+        END
+    ) AS porte,
+    emp.ente_federativo_responsavel,
+    est.uf,
+    named_struct(
+        'codigo', est.codigo_municipio,
+        'codigo_ibge', ibge.codigo_ibge,
+        'descricao', mun.descricao
+    ) AS municipio,
+    named_struct('codigo', est.codigo_pais, 'descricao', pae.descricao) AS pais,
+    named_struct(
+        'tipo_logradouro', est.tipo_logradouro,
+        'logradouro', est.logradouro,
+        'numero', est.numero,
+        'complemento', est.complemento,
+        'bairro', est.bairro,
+        'cep', est.cep
+    ) AS endereco,
+    est.email,
+    array_remove(
+        make_array(
+            CASE WHEN est.telefone1 IS NOT NULL AND length(est.telefone1) > 0
+                 THEN concat(coalesce(est.ddd1, ''), est.telefone1) END,
+            CASE WHEN est.telefone2 IS NOT NULL AND length(est.telefone2) > 0
+                 THEN concat(coalesce(est.ddd2, ''), est.telefone2) END
+        ), NULL
+    ) AS telefones,
+    sa.qsa,
+    CASE WHEN sim.opcao_pelo_simples_raw = 'S' THEN true
+         WHEN sim.opcao_pelo_simples_raw = 'N' THEN false
+         ELSE NULL END AS opcao_pelo_simples,
+    CASE
+        WHEN sim.data_opcao_pelo_simples_raw IS NULL
+          OR length(sim.data_opcao_pelo_simples_raw) = 0
+          OR sim.data_opcao_pelo_simples_raw = '00000000'
+        THEN NULL
+        ELSE to_date(sim.data_opcao_pelo_simples_raw, '%Y%m%d')
+    END AS data_opcao_pelo_simples,
+    CASE
+        WHEN sim.data_exclusao_do_simples_raw IS NULL
+          OR length(sim.data_exclusao_do_simples_raw) = 0
+          OR sim.data_exclusao_do_simples_raw = '00000000'
+        THEN NULL
+        ELSE to_date(sim.data_exclusao_do_simples_raw, '%Y%m%d')
+    END AS data_exclusao_do_simples,
+    CASE WHEN sim.opcao_pelo_mei_raw = 'S' THEN true
+         WHEN sim.opcao_pelo_mei_raw = 'N' THEN false
+         ELSE NULL END AS opcao_pelo_mei,
+    CASE
+        WHEN sim.data_opcao_pelo_mei_raw IS NULL
+          OR length(sim.data_opcao_pelo_mei_raw) = 0
+          OR sim.data_opcao_pelo_mei_raw = '00000000'
+        THEN NULL
+        ELSE to_date(sim.data_opcao_pelo_mei_raw, '%Y%m%d')
+    END AS data_opcao_pelo_mei,
+    CASE
+        WHEN sim.data_exclusao_do_mei_raw IS NULL
+          OR length(sim.data_exclusao_do_mei_raw) = 0
+          OR sim.data_exclusao_do_mei_raw = '00000000'
+        THEN NULL
+        ELSE to_date(sim.data_exclusao_do_mei_raw, '%Y%m%d')
+    END AS data_exclusao_do_mei
+FROM estabelecimentos est
+LEFT JOIN empresas emp ON emp.cnpj_basico = est.cnpj_basico
+LEFT JOIN cnaes cf ON cf.codigo = est.cnae_fiscal_principal
+LEFT JOIN naturezas nat ON nat.codigo = emp.natureza_juridica
+LEFT JOIN qualificacoes qr ON qr.codigo = emp.qualificacao_responsavel
+LEFT JOIN motivos mot ON mot.codigo = est.motivo_situacao_cadastral
+LEFT JOIN municipios mun ON mun.codigo = est.codigo_municipio
+LEFT JOIN paises pae ON pae.codigo = est.codigo_pais
+LEFT JOIN ibge ON ibge.codigo_tom = est.codigo_municipio
+LEFT JOIN socios_agg sa ON sa.cnpj_basico = est.cnpj_basico
+LEFT JOIN cnaes_sec_resolved csr ON csr.cnpj = concat(est.cnpj_basico, est.cnpj_ordem, est.cnpj_dv)
+LEFT JOIN simples sim ON sim.cnpj_basico = est.cnpj_basico
+"#;
+
+pub async fn consolidate(ctx: &SessionContext) -> Result<datafusion::dataframe::DataFrame> {
+    Ok(ctx.sql(CONSOLIDATION_SQL).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +525,93 @@ mod tests {
         let b = df.collect().await.unwrap();
         let v = b[0].column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap().value(0);
         assert_eq!(v, "3550308");
+    }
+
+    /// Raw (binary-safe) zip extraction used to unpack the outer archive
+    /// which itself contains zip files. `extract_zip_to_dir` assumes CP1252
+    /// text payloads, so it cannot be reused for an outer zip-of-zips.
+    fn extract_zip_raw(zip_path: &Path, out_dir: &Path) {
+        std::fs::create_dir_all(out_dir).unwrap();
+        let f = std::fs::File::open(zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(f).unwrap();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let name = entry.name().to_string();
+            if name.ends_with('/') {
+                continue;
+            }
+            let dest = out_dir.join(&name);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+            std::fs::write(&dest, &bytes).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn consolidates_testdata() {
+        let td = tempfile::TempDir::new().unwrap();
+        let zip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata").join("2026-01.zip");
+        // Outer zip wraps binary inner zips; extract them verbatim.
+        let ext_outer = td.path().join("outer");
+        extract_zip_raw(&zip, &ext_outer);
+        let inner_dir = if ext_outer.join("2026-01").exists() {
+            ext_outer.join("2026-01")
+        } else {
+            ext_outer.clone()
+        };
+        let ext_inner = td.path().join("inner");
+        for entry in std::fs::read_dir(&inner_dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|s| s.to_str()) == Some("zip") {
+                extract_zip_to_dir(&p, &ext_inner).unwrap();
+            }
+        }
+        let staging = td.path().join("staging");
+        organize_by_kind(&ext_inner, &staging).unwrap();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        register_sources(&ctx, &staging).await.unwrap();
+        // IBGE: the bundled testdata/tabmun.csv has 5 raw columns and no header;
+        // rewrite it to match Task 22's expected 4-column header schema.
+        let raw_ibge = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata").join("tabmun.csv");
+        let raw = std::fs::read_to_string(&raw_ibge).unwrap();
+        let mut adapted = String::from("codigo_tom;nome;uf;codigo_ibge\n");
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split(';').collect();
+            // Source order: codigo_tom;cnpj;nome;uf;codigo_ibge — drop the cnpj field.
+            if parts.len() >= 5 {
+                adapted.push_str(&format!(
+                    "{};{};{};{}\n",
+                    parts[0],
+                    parts[2].trim(),
+                    parts[3].trim(),
+                    parts[4].trim()
+                ));
+            }
+        }
+        let ibge_csv = td.path().join("tabmun.csv");
+        std::fs::write(&ibge_csv, adapted).unwrap();
+        register_ibge(&ctx, &ibge_csv).await.unwrap();
+
+        let df = consolidate(&ctx).await.unwrap();
+        let batches = df.collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total > 0, "consolidation produced zero rows");
+
+        // Verify expected columns exist.
+        let schema = batches[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        for expected in ["cnpj", "razao_social", "uf", "cnae_fiscal", "qsa"] {
+            assert!(names.contains(&expected), "missing column: {expected}");
+        }
     }
 
     #[test]
