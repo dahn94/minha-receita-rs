@@ -1,4 +1,3 @@
-use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -91,15 +90,74 @@ pub struct QueryFlags {
     pub output: Option<PathBuf>,
 }
 
-pub async fn run(_cli: Cli) -> anyhow::Result<()> {
-    // Implementado em tasks 7–25.
-    eprintln!("not yet implemented");
-    std::process::exit(2);
-}
+pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    use std::io;
+    use crate::query::{DataContext, SearchParams};
+    use crate::output;
 
-fn _open_output(path: Option<&PathBuf>) -> anyhow::Result<Box<dyn Write>> {
-    Ok(match path {
-        Some(p) => Box::new(std::fs::File::create(p)?),
-        None => Box::new(io::stdout()),
-    })
+    match cli.command {
+        Command::Init { root, period, concurrency } => {
+            let root = root.unwrap_or_else(crate::lifecycle::default_root);
+            crate::lifecycle::init(&root, period, concurrency).await?;
+            eprintln!("Init concluído em {}", root.display());
+        }
+        Command::Update { root, concurrency } => {
+            let root = root.unwrap_or_else(crate::lifecycle::default_root);
+            match crate::lifecycle::update(&root, concurrency).await? {
+                crate::lifecycle::UpdateOutcome::UpToDate(p) =>
+                    eprintln!("Já está na versão mais recente ({p})"),
+                crate::lifecycle::UpdateOutcome::Updated { from, to } =>
+                    eprintln!("Atualizado de {from} para {to}"),
+            }
+        }
+        Command::Download { out, period, concurrency } => {
+            let client = reqwest::Client::builder().user_agent("minha-receita-rs/0.1").build()?;
+            let period = period.map(|s| s.parse::<crate::schema::Period>()).transpose()?;
+            let p = crate::download::discover_and_download(
+                &client, crate::download::RECEITA_BASE_URL, period, &out, concurrency).await?;
+            let url = crate::download::fetch_ibge_url(&client).await?;
+            crate::download::download_file(&client, &url, &out.join("tabmun.csv")).await?;
+            eprintln!("Baixado período {p} em {}", out.display());
+        }
+        Command::Transform { r#in, out } => {
+            let ibge = r#in.join("tabmun.csv");
+            if !ibge.exists() {
+                anyhow::bail!("tabmun.csv não encontrado em {}", r#in.display());
+            }
+            crate::transform::run(&r#in, &ibge, &out).await?;
+            eprintln!("Transformação concluída em {}", out.display());
+        }
+        Command::Lookup { cnpj, query } => {
+            let data = query.data.ok_or_else(|| anyhow::anyhow!("--data ou MR_DATA não definido"))?;
+            let ctx = DataContext::open(&data).await?;
+            let batches = ctx.lookup(&cnpj).await?;
+            let mut out: Box<dyn io::Write> = match query.output {
+                Some(p) => Box::new(std::fs::File::create(p)?),
+                None => Box::new(io::stdout()),
+            };
+            output::write(query.format, &batches, &mut *out)?;
+        }
+        Command::Search { uf, cnae, bairro, municipio, natureza, situacao, limit, page, query } => {
+            let data = query.data.ok_or_else(|| anyhow::anyhow!("--data ou MR_DATA não definido"))?;
+            let ctx = DataContext::open(&data).await?;
+            let params = SearchParams { uf, cnae, bairro, municipio, natureza, situacao, limit, page };
+            let batches = ctx.search(&params).await?;
+            let mut out: Box<dyn io::Write> = match query.output {
+                Some(p) => Box::new(std::fs::File::create(p)?),
+                None => Box::new(io::stdout()),
+            };
+            output::write(query.format, &batches, &mut *out)?;
+        }
+        Command::Sql { query, flags } => {
+            let data = flags.data.ok_or_else(|| anyhow::anyhow!("--data ou MR_DATA não definido"))?;
+            let ctx = DataContext::open(&data).await?;
+            let batches = ctx.sql(&query).await?;
+            let mut out: Box<dyn io::Write> = match flags.output {
+                Some(p) => Box::new(std::fs::File::create(p)?),
+                None => Box::new(io::stdout()),
+            };
+            output::write(flags.format, &batches, &mut *out)?;
+        }
+    }
+    Ok(())
 }

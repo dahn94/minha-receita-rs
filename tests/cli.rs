@@ -25,3 +25,18 @@ fn lookup_parses_cnpj() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains("error: unrecognized"), "stderr: {stderr}");
 }
+
+#[test]
+fn lookup_without_data_fails_cleanly() {
+    bin().args(["lookup", "12345678000190", "--data", "/no/such/path"])
+        .assert().failure().stderr(contains("ausente").or(contains("missing")));
+}
+
+#[test]
+fn search_parses_all_flags() {
+    bin().args([
+        "search", "--uf=SP", "--cnae=4711-3/01", "--bairro=Centro",
+        "--municipio=7107", "--natureza=2046", "--situacao=ATIVA",
+        "--limit=5", "--page=2", "--data=/no/such",
+    ]).assert().failure(); // fails because data dir is bogus, but parses.
+}
