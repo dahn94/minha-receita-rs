@@ -120,3 +120,10 @@ impl DataContext {
         Ok(df.collect().await?)
     }
 }
+
+impl DataContext {
+    pub async fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
+        let df = self.ctx.sql(query).await?;
+        Ok(df.collect().await?)
+    }
+}
