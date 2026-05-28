@@ -1,7 +1,23 @@
 use scraper::{Html, Selector};
+use serde::Deserialize;
 
 use crate::schema::Period;
 use crate::{Error, Result};
+
+#[derive(Deserialize)]
+struct CkanPkg { result: CkanResult }
+#[derive(Deserialize)]
+struct CkanResult { resources: Vec<CkanResource> }
+#[derive(Deserialize)]
+struct CkanResource { url: String }
+
+pub fn parse_ibge_ckan(json: &str) -> Result<String> {
+    let pkg: CkanPkg = serde_json::from_str(json)?;
+    pkg.result.resources.into_iter()
+        .find(|r| r.url.to_lowercase().ends_with(".csv"))
+        .map(|r| r.url)
+        .ok_or_else(|| Error::MissingData("no CSV resource in CKAN response".into()))
+}
 
 pub fn parse_period_listing(html: &str) -> Vec<Period> {
     let doc = Html::parse_document(html);
@@ -75,5 +91,23 @@ mod tests {
         assert!(names.iter().any(|n| n == "Empresas0.zip"));
         assert!(names.iter().any(|n| n == "Cnaes.zip"));
         assert!(!names.iter().any(|n| n == "../"));
+    }
+
+    const CKAN_SAMPLE: &str = r#"
+{
+  "success": true,
+  "result": {
+    "resources": [
+      {"url": "https://example.com/other.pdf", "format": "pdf"},
+      {"url": "https://example.com/tabmun.csv", "format": "CSV"}
+    ]
+  }
+}
+"#;
+
+    #[test]
+    fn extracts_csv_resource_url() {
+        let url = parse_ibge_ckan(CKAN_SAMPLE).unwrap();
+        assert_eq!(url, "https://example.com/tabmun.csv");
     }
 }
