@@ -23,7 +23,7 @@ pub fn write(
     match format {
         Format::Table => write_table(batches, writer),
         Format::Csv => write_csv(batches, writer),
-        Format::Json => unimplemented!(),
+        Format::Json => write_json(batches, writer),
     }
 }
 
@@ -51,6 +51,15 @@ fn write_table(batches: &[RecordBatch], writer: &mut dyn Write) -> Result<()> {
     }
 
     writeln!(writer, "{table}")?;
+    Ok(())
+}
+
+fn write_json(batches: &[RecordBatch], writer: &mut dyn Write) -> Result<()> {
+    let mut w = arrow::json::LineDelimitedWriter::new(writer);
+    for batch in batches {
+        w.write(batch)?;
+    }
+    w.finish()?;
     Ok(())
 }
 
@@ -99,6 +108,18 @@ mod tests {
         assert_eq!(lines[0], "id,nome");
         assert_eq!(lines[1], "1,foo");
         assert_eq!(lines[2], "2,bar");
+    }
+
+    #[test]
+    fn json_format_emits_jsonl() {
+        let mut buf = Vec::new();
+        write(Format::Json, &[sample_batch()], &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v0["id"], 1);
+        assert_eq!(v0["nome"], "foo");
     }
 
     #[test]
