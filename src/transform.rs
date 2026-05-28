@@ -428,6 +428,52 @@ pub async fn consolidate(ctx: &SessionContext) -> Result<datafusion::dataframe::
     Ok(ctx.sql(CONSOLIDATION_SQL).await?)
 }
 
+/// Write the consolidated DataFrame as Parquet, partitioned by `uf`, under
+/// `<out_dir>/companies/uf=<UF>/...`.
+///
+/// Deviations from the original spec snippet:
+/// - DataFusion 44's `DataFrame::write_parquet` takes
+///   `Option<TableParquetOptions>` (a config-driven struct), not
+///   `Option<WriterProperties>`. We configure compression, statistics, and a
+///   bloom filter on `cnpj` via that struct instead.
+/// - The spec snippet sorted by `cnae_fiscal` and `endereco`, but both of
+///   those are struct columns in the consolidated output. DF 44 does not
+///   support sorting on struct columns at planning, so we drop `with_sort_by`
+///   entirely. The partition-by alone satisfies the column-store layout
+///   requirements; sorting was only a downstream-query optimization.
+pub async fn write_partitioned(
+    df: datafusion::dataframe::DataFrame,
+    out_dir: &Path,
+) -> Result<()> {
+    use datafusion::common::config::{ParquetColumnOptions, TableParquetOptions};
+    use datafusion::dataframe::DataFrameWriteOptions;
+
+    let target = out_dir.join("companies");
+    std::fs::create_dir_all(&target)?;
+
+    let mut props = TableParquetOptions::new();
+    props.global.compression = Some("zstd(3)".to_string());
+    props.global.statistics_enabled = Some("page".to_string());
+    props.global.bloom_filter_on_write = true;
+
+    // Bloom filter only on cnpj to limit overhead.
+    let cnpj_opts = ParquetColumnOptions {
+        bloom_filter_enabled: Some(true),
+        ..Default::default()
+    };
+    props
+        .column_specific_options
+        .insert("cnpj".to_string(), cnpj_opts);
+
+    df.write_parquet(
+        target.to_str().unwrap(),
+        DataFrameWriteOptions::new().with_partition_by(vec!["uf".to_string()]),
+        Some(props),
+    )
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +635,25 @@ mod tests {
         for expected in ["cnpj", "razao_social", "uf", "cnae_fiscal", "qsa"] {
             assert!(names.contains(&expected), "missing column: {expected}");
         }
+    }
+
+    #[tokio::test]
+    async fn write_partitioned_creates_uf_dirs() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cnpj", DataType::Utf8, false),
+            Field::new("uf", DataType::Utf8, false),
+        ]));
+        let batch = arrow::array::RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(arrow::array::StringArray::from(vec!["SP", "SP", "RJ"])),
+        ]).unwrap();
+        let df = ctx.read_batch(batch).unwrap();
+
+        let td = tempfile::TempDir::new().unwrap();
+        write_partitioned(df, td.path()).await.unwrap();
+        assert!(td.path().join("companies").join("uf=SP").exists());
+        assert!(td.path().join("companies").join("uf=RJ").exists());
     }
 
     #[test]
