@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use futures::StreamExt;
+use futures::stream::{self, StreamExt};
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
@@ -40,6 +40,28 @@ pub async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> 
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
+    Ok(())
+}
+
+pub async fn download_all(
+    client: &reqwest::Client,
+    urls: &[String],
+    dest_dir: &Path,
+    concurrency: usize,
+) -> Result<()> {
+    std::fs::create_dir_all(dest_dir)?;
+    let results: Vec<Result<()>> = stream::iter(urls.iter().cloned())
+        .map(|url| {
+            let client = client.clone();
+            let dest = dest_dir.join(url.rsplit('/').next().unwrap_or("file.bin"));
+            async move { download_file(&client, &url, &dest).await }
+        })
+        .buffer_unordered(concurrency.max(1))
+        .collect()
+        .await;
+    for r in results {
+        r?;
+    }
     Ok(())
 }
 
@@ -185,5 +207,24 @@ mod tests {
         let client = reqwest::Client::new();
         download_file(&client, &format!("{}/file.zip", server.url()), &dest).await.unwrap();
         m_head.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn parallel_orchestrator_downloads_all() {
+        let mut server = mockito::Server::new_async().await;
+        let m1 = server.mock("GET", "/a.zip").with_status(200).with_body("aaa")
+            .with_header("content-length", "3").create_async().await;
+        let m2 = server.mock("GET", "/b.zip").with_status(200).with_body("bbbb")
+            .with_header("content-length", "4").create_async().await;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let client = reqwest::Client::new();
+        let urls = vec![format!("{}/a.zip", server.url()), format!("{}/b.zip", server.url())];
+        download_all(&client, &urls, td.path(), 2).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(td.path().join("a.zip")).unwrap(), "aaa");
+        assert_eq!(std::fs::read_to_string(td.path().join("b.zip")).unwrap(), "bbbb");
+        m1.assert_async().await;
+        m2.assert_async().await;
     }
 }
