@@ -474,6 +474,28 @@ pub async fn write_partitioned(
     Ok(())
 }
 
+pub async fn run(zip_dir: &Path, ibge_csv: &Path, out_dir: &Path) -> Result<()> {
+    let tmp = tempfile::TempDir::new()?;
+    let ext = tmp.path().join("ext");
+    let staging = tmp.path().join("staging");
+
+    tracing::info!("Extracting ZIPs from {}", zip_dir.display());
+    extract_all(zip_dir, &ext)?;
+    tracing::info!("Organizing files by kind");
+    organize_by_kind(&ext, &staging)?;
+
+    let ctx = SessionContext::new();
+    tracing::info!("Registering source tables");
+    register_sources(&ctx, &staging).await?;
+    register_ibge(&ctx, ibge_csv).await?;
+
+    tracing::info!("Consolidating");
+    let df = consolidate(&ctx).await?;
+    tracing::info!("Writing partitioned parquet to {}", out_dir.display());
+    write_partitioned(df, out_dir).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +676,48 @@ mod tests {
         write_partitioned(df, td.path()).await.unwrap();
         assert!(td.path().join("companies").join("uf=SP").exists());
         assert!(td.path().join("companies").join("uf=RJ").exists());
+    }
+
+    #[tokio::test]
+    async fn run_end_to_end_on_testdata() {
+        let td = tempfile::TempDir::new().unwrap();
+        let testdata = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
+
+        // Pre-step: extract `2026-01.zip` to simulate a download — produces inner zips.
+        let in_dir = td.path().join("zips");
+        std::fs::create_dir_all(&in_dir).unwrap();
+        let outer = td.path().join("outer");
+        extract_zip_to_dir(&testdata.join("2026-01.zip"), &outer).unwrap();
+        let inner_src = if outer.join("2026-01").exists() { outer.join("2026-01") } else { outer.clone() };
+        for entry in std::fs::read_dir(&inner_src).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|s| s.to_str()) == Some("zip") {
+                std::fs::copy(&p, in_dir.join(p.file_name().unwrap())).unwrap();
+            }
+        }
+
+        let out = td.path().join("parquet");
+        run(&in_dir, &testdata.join("tabmun.csv"), &out).await.unwrap();
+
+        assert!(out.join("companies").exists());
+        let count = walkdir(&out.join("companies"))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
+            .count();
+        assert!(count > 0, "no parquet files written");
+    }
+
+    fn walkdir(p: &Path) -> impl Iterator<Item = std::path::PathBuf> + '_ {
+        let mut stack = vec![p.to_path_buf()];
+        std::iter::from_fn(move || {
+            while let Some(d) = stack.pop() {
+                let rd = std::fs::read_dir(&d).ok()?;
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() { stack.push(p); } else { return Some(p); }
+                }
+            }
+            None
+        })
     }
 
     #[test]
