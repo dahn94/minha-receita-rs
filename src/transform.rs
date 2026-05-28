@@ -142,6 +142,24 @@ pub fn extract_zip_to_dir(zip_path: &Path, out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn organize_by_kind(extracted: &Path, staging: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(extracted)? {
+        let entry = entry?;
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if let Some(kind) = classify(name) {
+            let dest_dir = staging.join(kind);
+            std::fs::create_dir_all(&dest_dir)?;
+            let dest = dest_dir.join(format!("{}.csv", name));
+            std::fs::copy(&p, &dest)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn extract_all(zip_dir: &Path, out_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
     for entry in std::fs::read_dir(zip_dir)? {
@@ -223,6 +241,25 @@ mod tests {
         let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names[0], "cnpj_basico");
         assert!(names.contains(&"uf"));
+    }
+
+    #[test]
+    fn organize_by_kind_moves_files() {
+        let td = tempfile::TempDir::new().unwrap();
+        let extracted = td.path().join("ext");
+        std::fs::create_dir_all(&extracted).unwrap();
+        std::fs::write(extracted.join("Empresas0"), "a;b").unwrap();
+        std::fs::write(extracted.join("Empresas1"), "c;d").unwrap();
+        std::fs::write(extracted.join("Cnaes"), "e;f").unwrap();
+        std::fs::write(extracted.join("ignore.txt"), "x").unwrap();
+
+        let staging = td.path().join("staging");
+        organize_by_kind(&extracted, &staging).unwrap();
+
+        assert!(staging.join("empresas").join("Empresas0.csv").exists());
+        assert!(staging.join("empresas").join("Empresas1.csv").exists());
+        assert!(staging.join("cnaes").join("Cnaes.csv").exists());
+        assert!(!staging.join("ignore.txt").exists());
     }
 
     #[test]
