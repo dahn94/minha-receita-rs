@@ -22,7 +22,7 @@ pub fn write(
 ) -> Result<()> {
     match format {
         Format::Table => write_table(batches, writer),
-        Format::Csv => unimplemented!(),
+        Format::Csv => write_csv(batches, writer),
         Format::Json => unimplemented!(),
     }
 }
@@ -54,6 +54,16 @@ fn write_table(batches: &[RecordBatch], writer: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+fn write_csv(batches: &[RecordBatch], writer: &mut dyn Write) -> Result<()> {
+    let mut w = arrow::csv::WriterBuilder::new()
+        .with_header(true)
+        .build(writer);
+    for batch in batches {
+        w.write(batch)?;
+    }
+    Ok(())
+}
+
 fn format_cell(array: &dyn Array, row: usize) -> String {
     if array.is_null(row) {
         return "".to_string();
@@ -78,6 +88,17 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn csv_format_emits_csv() {
+        let mut buf = Vec::new();
+        write(Format::Csv, &[sample_batch()], &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines[0], "id,nome");
+        assert_eq!(lines[1], "1,foo");
+        assert_eq!(lines[2], "2,bar");
     }
 
     #[test]
