@@ -1,8 +1,92 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::Result;
+
+pub fn raw_schema(kind: &str) -> Option<SchemaRef> {
+    let f = |n: &str, t: DataType| Field::new(n, t, true);
+    let utf = |n: &str| f(n, DataType::Utf8);
+
+    let schema = match kind {
+        "empresas" => Schema::new(vec![
+            utf("cnpj_basico"),
+            utf("razao_social"),
+            utf("natureza_juridica"),
+            utf("qualificacao_responsavel"),
+            utf("capital_social_raw"),
+            utf("porte"),
+            utf("ente_federativo_responsavel"),
+        ]),
+        "estabelecimentos" => Schema::new(vec![
+            utf("cnpj_basico"),
+            utf("cnpj_ordem"),
+            utf("cnpj_dv"),
+            utf("identificador_matriz_filial"),
+            utf("nome_fantasia"),
+            utf("situacao_cadastral_codigo"),
+            utf("data_situacao_cadastral_raw"),
+            utf("motivo_situacao_cadastral"),
+            utf("nome_cidade_exterior"),
+            utf("codigo_pais"),
+            utf("data_inicio_atividade_raw"),
+            utf("cnae_fiscal_principal"),
+            utf("cnae_fiscal_secundaria"),
+            utf("tipo_logradouro"),
+            utf("logradouro"),
+            utf("numero"),
+            utf("complemento"),
+            utf("bairro"),
+            utf("cep"),
+            utf("uf"),
+            utf("codigo_municipio"),
+            utf("ddd1"),
+            utf("telefone1"),
+            utf("ddd2"),
+            utf("telefone2"),
+            utf("ddd_fax"),
+            utf("fax"),
+            utf("email"),
+            utf("situacao_especial"),
+            utf("data_situacao_especial_raw"),
+        ]),
+        "socios" => Schema::new(vec![
+            utf("cnpj_basico"),
+            utf("identificador_de_socio"),
+            utf("nome_socio"),
+            utf("cnpj_cpf_do_socio"),
+            utf("codigo_qualificacao_socio"),
+            utf("data_entrada_sociedade_raw"),
+            utf("codigo_pais"),
+            utf("cpf_representante_legal"),
+            utf("nome_representante_legal"),
+            utf("codigo_qualificacao_representante_legal"),
+            utf("codigo_faixa_etaria"),
+        ]),
+        "simples" => Schema::new(vec![
+            utf("cnpj_basico"),
+            utf("opcao_pelo_simples_raw"),
+            utf("data_opcao_pelo_simples_raw"),
+            utf("data_exclusao_do_simples_raw"),
+            utf("opcao_pelo_mei_raw"),
+            utf("data_opcao_pelo_mei_raw"),
+            utf("data_exclusao_do_mei_raw"),
+        ]),
+        "cnaes" | "motivos" | "naturezas" | "paises" | "qualificacoes" => Schema::new(vec![
+            utf("codigo"),
+            utf("descricao"),
+        ]),
+        "municipios" => Schema::new(vec![
+            utf("codigo"),
+            utf("descricao"),
+        ]),
+        _ => return None,
+    };
+    Some(Arc::new(schema))
+}
 
 pub fn classify(name: &str) -> Option<&'static str> {
     let upper = name.to_uppercase();
@@ -126,6 +210,19 @@ mod tests {
         assert_eq!(classify("F.K03200$Z.D10110.QUALSCSV"), Some("qualificacoes"));
         assert_eq!(classify("D10110.SIMPLES.CSV.D10110"), Some("simples"));
         assert_eq!(classify("ignore.txt"), None);
+    }
+
+    #[test]
+    fn raw_schemas_have_expected_columns() {
+        let s = raw_schema("empresas").unwrap();
+        let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names[0], "cnpj_basico");
+        assert_eq!(names[1], "razao_social");
+
+        let s = raw_schema("estabelecimentos").unwrap();
+        let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names[0], "cnpj_basico");
+        assert!(names.contains(&"uf"));
     }
 
     #[test]
