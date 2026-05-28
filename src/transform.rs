@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::listing::ListingOptions;
+use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
 
 use crate::Result;
@@ -109,6 +110,31 @@ pub async fn register_sources(ctx: &SessionContext, staging: &Path) -> Result<()
         ctx.register_listing_table(kind, dir.to_str().unwrap(), opts, Some(schema), None)
             .await?;
     }
+    Ok(())
+}
+
+pub async fn register_ibge(ctx: &SessionContext, csv_path: &Path) -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("codigo_tom", DataType::Utf8, true),
+        Field::new("nome", DataType::Utf8, true),
+        Field::new("uf", DataType::Utf8, true),
+        Field::new("codigo_ibge", DataType::Utf8, true),
+    ]));
+    let file_name = csv_path.file_name().unwrap().to_str().unwrap();
+    let tmp = tempfile::TempDir::new()?;
+    std::fs::copy(csv_path, tmp.path().join(file_name))?;
+    let df = ctx
+        .read_csv(
+            tmp.path().to_str().unwrap(),
+            CsvReadOptions::new()
+                .has_header(true)
+                .delimiter(b';')
+                .schema(schema.as_ref()),
+        )
+        .await?;
+    let batches = df.collect().await?;
+    let mem = MemTable::try_new(schema, vec![batches])?;
+    ctx.register_table("ibge", Arc::new(mem))?;
     Ok(())
 }
 
@@ -299,6 +325,20 @@ mod tests {
         let b = df.collect().await.unwrap();
         let n = b[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
         assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn register_ibge_provides_mapping() {
+        let td = tempfile::TempDir::new().unwrap();
+        let csv = td.path().join("tabmun.csv");
+        std::fs::write(&csv, "codigo_tom;nome;uf;codigo_ibge\n7107;SAO PAULO;SP;3550308\n").unwrap();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        register_ibge(&ctx, &csv).await.unwrap();
+        let df = ctx.sql("SELECT codigo_ibge FROM ibge WHERE codigo_tom = '7107'").await.unwrap();
+        let b = df.collect().await.unwrap();
+        let v = b[0].column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap().value(0);
+        assert_eq!(v, "3550308");
     }
 
     #[test]
