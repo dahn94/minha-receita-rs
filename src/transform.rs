@@ -114,8 +114,9 @@ pub async fn register_sources(ctx: &SessionContext, staging: &Path) -> Result<()
 }
 
 pub async fn register_ibge(ctx: &SessionContext, csv_path: &Path) -> Result<()> {
-    let schema = Arc::new(Schema::new(vec![
+    let raw_schema = Arc::new(Schema::new(vec![
         Field::new("codigo_tom", DataType::Utf8, true),
+        Field::new("cnpj", DataType::Utf8, true),
         Field::new("nome", DataType::Utf8, true),
         Field::new("uf", DataType::Utf8, true),
         Field::new("codigo_ibge", DataType::Utf8, true),
@@ -127,13 +128,26 @@ pub async fn register_ibge(ctx: &SessionContext, csv_path: &Path) -> Result<()> 
         .read_csv(
             tmp.path().to_str().unwrap(),
             CsvReadOptions::new()
-                .has_header(true)
+                .has_header(false)
                 .delimiter(b';')
-                .schema(schema.as_ref()),
+                .schema(raw_schema.as_ref()),
         )
         .await?;
-    let batches = df.collect().await?;
-    let mem = MemTable::try_new(schema, vec![batches])?;
+    let projected = df
+        .select(vec![
+            col("codigo_tom"),
+            trim(vec![col("nome")]).alias("nome"),
+            trim(vec![col("uf")]).alias("uf"),
+            trim(vec![col("codigo_ibge")]).alias("codigo_ibge"),
+        ])?;
+    let final_schema = Arc::new(Schema::new(vec![
+        Field::new("codigo_tom", DataType::Utf8, true),
+        Field::new("nome", DataType::Utf8, true),
+        Field::new("uf", DataType::Utf8, true),
+        Field::new("codigo_ibge", DataType::Utf8, true),
+    ]));
+    let batches = projected.collect().await?;
+    let mem = MemTable::try_new(final_schema, vec![batches])?;
     ctx.register_table("ibge", Arc::new(mem))?;
     Ok(())
 }
@@ -178,16 +192,22 @@ pub fn extract_zip_to_dir(zip_path: &Path, out_dir: &Path) -> Result<()> {
         }
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes)?;
-        let (decoded, _, had_errors) = encoding_rs::WINDOWS_1252.decode(&bytes);
-        if had_errors {
-            tracing::warn!(file=%name, "cp1252 decoding produced replacement chars");
-        }
         let dest = out_dir.join(&name);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut f = File::create(&dest)?;
-        f.write_all(decoded.as_bytes())?;
+        // Receita outer zips wrap binary inner zips; only CP1252-decode text payloads.
+        let is_binary = name.to_lowercase().ends_with(".zip");
+        if is_binary {
+            f.write_all(&bytes)?;
+        } else {
+            let (decoded, _, had_errors) = encoding_rs::WINDOWS_1252.decode(&bytes);
+            if had_errors {
+                tracing::warn!(file=%name, "cp1252 decoding produced replacement chars");
+            }
+            f.write_all(decoded.as_bytes())?;
+        }
     }
     Ok(())
 }
@@ -517,37 +537,17 @@ mod tests {
     async fn register_ibge_provides_mapping() {
         let td = tempfile::TempDir::new().unwrap();
         let csv = td.path().join("tabmun.csv");
-        std::fs::write(&csv, "codigo_tom;nome;uf;codigo_ibge\n7107;SAO PAULO;SP;3550308\n").unwrap();
+        // Real wire format: 5 columns, no header, with padded names.
+        std::fs::write(&csv, "7107;26994533000120;SAO PAULO                                     ;SP;3550308\n").unwrap();
 
         let ctx = datafusion::prelude::SessionContext::new();
         register_ibge(&ctx, &csv).await.unwrap();
-        let df = ctx.sql("SELECT codigo_ibge FROM ibge WHERE codigo_tom = '7107'").await.unwrap();
+        let df = ctx.sql("SELECT codigo_ibge, nome FROM ibge WHERE codigo_tom = '7107'").await.unwrap();
         let b = df.collect().await.unwrap();
-        let v = b[0].column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap().value(0);
-        assert_eq!(v, "3550308");
-    }
-
-    /// Raw (binary-safe) zip extraction used to unpack the outer archive
-    /// which itself contains zip files. `extract_zip_to_dir` assumes CP1252
-    /// text payloads, so it cannot be reused for an outer zip-of-zips.
-    fn extract_zip_raw(zip_path: &Path, out_dir: &Path) {
-        std::fs::create_dir_all(out_dir).unwrap();
-        let f = std::fs::File::open(zip_path).unwrap();
-        let mut archive = zip::ZipArchive::new(f).unwrap();
-        for i in 0..archive.len() {
-            let mut entry = archive.by_index(i).unwrap();
-            let name = entry.name().to_string();
-            if name.ends_with('/') {
-                continue;
-            }
-            let dest = out_dir.join(&name);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).unwrap();
-            }
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
-            std::fs::write(&dest, &bytes).unwrap();
-        }
+        let ibge = b[0].column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap().value(0);
+        let nome = b[0].column(1).as_any().downcast_ref::<arrow::array::StringArray>().unwrap().value(0);
+        assert_eq!(ibge, "3550308");
+        assert_eq!(nome, "SAO PAULO");
     }
 
     #[tokio::test]
@@ -555,9 +555,8 @@ mod tests {
         let td = tempfile::TempDir::new().unwrap();
         let zip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata").join("2026-01.zip");
-        // Outer zip wraps binary inner zips; extract them verbatim.
         let ext_outer = td.path().join("outer");
-        extract_zip_raw(&zip, &ext_outer);
+        extract_zip_to_dir(&zip, &ext_outer).unwrap();
         let inner_dir = if ext_outer.join("2026-01").exists() {
             ext_outer.join("2026-01")
         } else {
@@ -575,30 +574,8 @@ mod tests {
 
         let ctx = datafusion::prelude::SessionContext::new();
         register_sources(&ctx, &staging).await.unwrap();
-        // IBGE: the bundled testdata/tabmun.csv has 5 raw columns and no header;
-        // rewrite it to match Task 22's expected 4-column header schema.
-        let raw_ibge = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let ibge_csv = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata").join("tabmun.csv");
-        let raw = std::fs::read_to_string(&raw_ibge).unwrap();
-        let mut adapted = String::from("codigo_tom;nome;uf;codigo_ibge\n");
-        for line in raw.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let parts: Vec<&str> = line.split(';').collect();
-            // Source order: codigo_tom;cnpj;nome;uf;codigo_ibge — drop the cnpj field.
-            if parts.len() >= 5 {
-                adapted.push_str(&format!(
-                    "{};{};{};{}\n",
-                    parts[0],
-                    parts[2].trim(),
-                    parts[3].trim(),
-                    parts[4].trim()
-                ));
-            }
-        }
-        let ibge_csv = td.path().join("tabmun.csv");
-        std::fs::write(&ibge_csv, adapted).unwrap();
         register_ibge(&ctx, &ibge_csv).await.unwrap();
 
         let df = consolidate(&ctx).await.unwrap();
