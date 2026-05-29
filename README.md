@@ -158,12 +158,13 @@ minha-receita-rs lookup 33683111000280 --format json
 
 ### Busca filtrada
 
-Filtros são combinados com `AND`. Resultados são paginados (`--limit`, `--page`).
+Filtros são combinados com `AND`. Por padrão mostra os primeiros `--limit` (10);
+use `--all` pra trazer **todos** os resultados.
 
 ```sh
-minha-receita-rs search --uf SP --limit 10
+minha-receita-rs search --uf SP --limit 50
 minha-receita-rs search --uf RJ --cnae 4711-3/01 --bairro Centro
-minha-receita-rs search --situacao ATIVA --municipio 7107 --limit 50 --page 2
+minha-receita-rs search --situacao ATIVA --municipio 7107 --all --output rj.csv
 ```
 
 O `search` mostra uma visão concisa pra caber na tela (cnpj, razão social, nome
@@ -171,7 +172,8 @@ fantasia, situação, município, UF e CNAE) — sem as colunas aninhadas. Pro
 registro completo de uma empresa, use `lookup <cnpj>`.
 
 Flags disponíveis: `--uf`, `--cnae`, `--bairro`, `--municipio`, `--natureza`,
-`--situacao`, `--limit` (default 10, máx 100), `--page` (default 1).
+`--situacao`, `--limit` (default 10, máx 100), `--all` (todos, ignora `--limit`).
+Pra controle fino (ordenação, offset), use o comando `sql`.
 
 Detalhes de formato: `--cnae` aceita os dois jeitos (`4711-3/01` ou `4711301`);
 `--bairro` é case-insensitive (`Centro` = `CENTRO`); `--uf`, `--situacao`
