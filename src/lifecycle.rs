@@ -3,12 +3,18 @@ use std::path::{Path, PathBuf};
 use crate::schema::Period;
 use crate::{Error, Result};
 
+/// Where the local data (zips + Parquet) lives by default.
+///
+/// `MR_DATA` overrides it. Otherwise we use `<crate root>/data` — the path of
+/// this clone, baked in at build time — so the data sits next to the source
+/// (gitignored) and every command finds it no matter what directory the binary
+/// is invoked from. Moving/deleting the clone after building invalidates this;
+/// rebuilding (or setting `MR_DATA`) fixes it.
 pub fn default_root() -> PathBuf {
     if let Ok(env) = std::env::var("MR_DATA") {
         return PathBuf::from(env);
     }
-    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("minha-receita-rs")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data")
 }
 
 /// Testable variant: assumes the outer zip is already on disk and tabmun.csv too.

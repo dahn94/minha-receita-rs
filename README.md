@@ -93,16 +93,21 @@ minha-receita-rs init
 O `init` faz três coisas:
 
 1. **Descobre** o período mais recente publicado pela Receita.
-2. **Baixa** os ~5 GB de ZIPs + a tabela do IBGE.
-3. **Transforma** em Parquet particionado por UF (mais ~20 GB extraídos, depois
-   ~3 GB no Parquet final).
+2. **Baixa** os ~7 GB de ZIPs + a tabela do IBGE.
+3. **Transforma** em Parquet particionado por UF (~20 GB extraídos
+   temporariamente, depois ~18 GB no Parquet final).
 
-Reserve uns **20 GB livres** e umas **2 horas** em rede boa. Você pode reduzir
-isso fixando um período específico:
+A base é o **Brasil inteiro** — ~70 milhões de estabelecimentos, todas as UFs
+(+ exterior). Reserve uns **45 GB livres** (pico, durante a transformação) e
+bastante tempo na primeira vez. Você pode fixar um período específico:
 
 ```sh
 minha-receita-rs init --period 2026-04
 ```
+
+> O `--period` escolhe **qual versão mensal** (competência) baixar — cada uma é
+> a base nacional **completa**, não um recorte daquele mês. As datas de abertura
+> das empresas vão de 1891 até hoje.
 
 Quando publicarem um novo período, atualize:
 
@@ -112,19 +117,23 @@ minha-receita-rs update
 
 ### Onde os dados ficam
 
-Por padrão:
+Por padrão, **dentro do próprio projeto**, em `data/` na raiz do repositório (já
+está no `.gitignore`, então nunca vai pro Git):
 
-- **Linux:** `~/.local/share/minha-receita-rs/`
-- **macOS:** `~/Library/Application Support/minha-receita-rs/`
-- **Windows:** `%APPDATA%\minha-receita-rs\`
-
-Pra usar um caminho seu:
-
-```sh
-minha-receita-rs init --root /caminho/que/eu/quiser
+```
+<seu-clone>/data/
+├── zips/        # ZIPs da Receita + tabmun.csv (IBGE)
+├── companies/   # Parquet particionado por UF (uf=AC/, uf=SP/, …)
+└── .period      # competência baixada (ex.: 2026-04)
 ```
 
-Ou exporte uma variável que vale pra todos os comandos:
+Esse caminho é fixado quando você compila (é o diretório do seu clone), então
+**todos os comandos acham os dados sozinhos** — não importa de onde você rode o
+binário, e você não precisa passar `--data`. Se mover ou apagar o clone depois
+de compilar, é só recompilar (`cargo build --release`).
+
+Pra usar outro caminho (ex.: um disco maior), exporte `MR_DATA` — vale pra todos
+os comandos:
 
 ```sh
 # Linux/macOS
@@ -132,6 +141,8 @@ export MR_DATA=/caminho/que/eu/quiser
 # Windows PowerShell
 $env:MR_DATA = "C:\caminho\que\eu\quiser"
 ```
+
+Ou, pontualmente: `init --root /caminho` e as consultas com `--data /caminho`.
 
 ---
 
@@ -157,6 +168,10 @@ minha-receita-rs search --situacao ATIVA --municipio 7107 --limit 50 --page 2
 
 Flags disponíveis: `--uf`, `--cnae`, `--bairro`, `--municipio`, `--natureza`,
 `--situacao`, `--limit` (default 10, máx 100), `--page` (default 1).
+
+Detalhes de formato: `--cnae` aceita os dois jeitos (`4711-3/01` ou `4711301`);
+`--bairro` é case-insensitive (`Centro` = `CENTRO`); `--uf`, `--situacao`
+(`ATIVA`/`BAIXADA`/…) e os códigos (`--municipio`, `--natureza`) batem exato.
 
 ### SQL bruto
 
@@ -199,7 +214,7 @@ minha-receita-rs lookup 33683111000280 --format json --output empresa.jsonl
 
 | Variável        | Uso |
 |---|---|
-| `MR_DATA`       | Diretório raiz do dado local (sobrescreve o padrão do SO). |
+| `MR_DATA`       | Diretório raiz do dado local (sobrescreve o padrão `<clone>/data`). |
 | `RUST_LOG`      | Verbosidade dos logs (`error`, `warn`, `info`, `debug`, `trace`). Padrão `info`. |
 | `MR_MEMORY_GB`  | Força um perfil de memória durante `init`/`transform`. Por padrão a RAM total é detectada e usada pra escolher chunks por UF + paralelismo. Use se quiser limitar (ex.: `MR_MEMORY_GB=8` num laptop disputando RAM). |
 
@@ -224,7 +239,12 @@ with C++" pelo Visual Studio Installer.
 detectados via `HEAD` + `Content-Length` e pulados.
 
 **`init` reclama que `companies/` já existe** — Use `update` em vez de `init`,
-ou apague o diretório antes (`rm -rf $MR_DATA/companies`).
+ou apague o diretório antes (`rm -rf data/companies`, ou `$MR_DATA/companies`
+se você configurou `MR_DATA`).
+
+**Consulta diz que não acha o dado** — As consultas usam `<clone>/data` por
+padrão. Se você moveu o clone depois de compilar, recompile (`cargo build
+--release`) ou aponte com `--data /caminho` / `MR_DATA`.
 
 ---
 

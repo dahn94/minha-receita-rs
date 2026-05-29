@@ -152,9 +152,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             eprintln!("Transformação concluída em {}", out.display());
         }
         Command::Lookup { cnpj, query } => {
-            let data = query
-                .data
-                .ok_or_else(|| anyhow::anyhow!("--data ou MR_DATA não definido"))?;
+            let data = query.data.unwrap_or_else(crate::lifecycle::default_root);
             let ctx = DataContext::open(&data).await?;
             let batches = ctx.lookup(&cnpj).await?;
             let mut out: Box<dyn io::Write> = match query.output {
@@ -174,9 +172,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             page,
             query,
         } => {
-            let data = query
-                .data
-                .ok_or_else(|| anyhow::anyhow!("--data ou MR_DATA não definido"))?;
+            let data = query.data.unwrap_or_else(crate::lifecycle::default_root);
             let ctx = DataContext::open(&data).await?;
             let params = SearchParams {
                 uf,
@@ -196,9 +192,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             output::write(query.format, &batches, &mut *out)?;
         }
         Command::Sql { query, flags } => {
-            let data = flags
-                .data
-                .ok_or_else(|| anyhow::anyhow!("--data ou MR_DATA não definido"))?;
+            let data = flags.data.unwrap_or_else(crate::lifecycle::default_root);
             let ctx = DataContext::open(&data).await?;
             let batches = ctx.sql(&query).await?;
             let mut out: Box<dyn io::Write> = match flags.output {
