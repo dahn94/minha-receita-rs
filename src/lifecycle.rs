@@ -90,11 +90,14 @@ pub async fn init(root: &Path, period_override: Option<String>, concurrency: usi
         .build()?;
     let period = period_override.map(|s| s.parse::<Period>()).transpose()?;
     let zips = root.join("zips");
+    eprintln!("==> Baixando arquivos da Receita");
     let actual_period =
         discover_and_download(&client, RECEITA_BASE_URL, period, &zips, concurrency).await?;
+    eprintln!("==> Baixando tabela IBGE");
     let ibge_url = fetch_ibge_url(&client).await?;
     let ibge_csv = zips.join("tabmun.csv");
     download_file(&client, &ibge_url, &ibge_csv).await?;
+    eprintln!("==> Transformando para Parquet");
     crate::transform::run(&zips, &ibge_csv, root).await?;
     std::fs::write(root.join(".period"), actual_period.to_string())?;
     Ok(())

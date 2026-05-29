@@ -478,20 +478,28 @@ pub async fn run(zip_dir: &Path, ibge_csv: &Path, out_dir: &Path) -> Result<()> 
     let ext = tmp.path().join("ext");
     let staging = tmp.path().join("staging");
 
-    tracing::info!("Extracting ZIPs from {}", zip_dir.display());
+    let spinner = indicatif::ProgressBar::new_spinner();
+    spinner.set_style(
+        indicatif::ProgressStyle::with_template("{spinner:.cyan} [{elapsed_precise}] {msg}")
+            .unwrap(),
+    );
+    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    spinner.set_message(format!("Extraindo ZIPs de {}", zip_dir.display()));
     extract_all(zip_dir, &ext)?;
-    tracing::info!("Organizing files by kind");
+    spinner.set_message("Organizando arquivos por tipo");
     organize_by_kind(&ext, &staging)?;
 
     let ctx = SessionContext::new();
-    tracing::info!("Registering source tables");
+    spinner.set_message("Registrando tabelas-fonte");
     register_sources(&ctx, &staging).await?;
     register_ibge(&ctx, ibge_csv).await?;
 
-    tracing::info!("Consolidating");
+    spinner.set_message("Consolidando (planejando query)");
     let df = consolidate(&ctx).await?;
-    tracing::info!("Writing partitioned parquet to {}", out_dir.display());
+    spinner.set_message(format!("Escrevendo Parquet em {}", out_dir.display()));
     write_partitioned(df, out_dir).await?;
+    spinner.finish_with_message("Transformação concluída");
     Ok(())
 }
 

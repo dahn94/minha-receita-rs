@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use futures::stream::{self, StreamExt};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
@@ -9,21 +10,36 @@ use crate::schema::Period;
 use crate::{Error, Result};
 
 pub async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
-    // Resume / skip se já existir com tamanho conhecido.
-    if dest.exists() {
-        let local_len = std::fs::metadata(dest)?.len();
-        let head = client.head(url).send().await?;
-        if let Some(remote_len) = head
-            .headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            && local_len == remote_len
-        {
+    download_file_with_progress(client, url, dest, None).await
+}
+
+async fn download_file_with_progress(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    pb: Option<&ProgressBar>,
+) -> Result<()> {
+    let head = client.head(url).send().await?;
+    let remote_len = head
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    if dest.exists()
+        && let Some(rl) = remote_len
+        && std::fs::metadata(dest)?.len() == rl
+    {
+        if let Some(pb) = pb {
+            pb.set_length(rl);
+            pb.set_position(rl);
+            pb.finish_with_message("já completo");
+        } else {
             tracing::info!(file=%dest.display(), "already complete, skipping");
-            return Ok(());
         }
+        return Ok(());
     }
+
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -35,13 +51,22 @@ pub async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> 
             status: status.as_u16(),
         });
     }
+    if let (Some(pb), Some(rl)) = (pb, remote_len) {
+        pb.set_length(rl);
+    }
     let mut file = tokio::fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         file.write_all(&chunk).await?;
+        if let Some(pb) = pb {
+            pb.inc(chunk.len() as u64);
+        }
     }
     file.flush().await?;
+    if let Some(pb) = pb {
+        pb.finish_with_message("ok");
+    }
     Ok(())
 }
 
@@ -52,15 +77,36 @@ pub async fn download_all(
     concurrency: usize,
 ) -> Result<()> {
     std::fs::create_dir_all(dest_dir)?;
-    let results: Vec<Result<()>> = stream::iter(urls.iter().cloned())
+
+    let multi = MultiProgress::new();
+    let style = ProgressStyle::with_template(
+        "{prefix:25!} [{bar:30.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12} eta {eta:>4} {msg}",
+    )
+    .unwrap()
+    .progress_chars("=> ");
+
+    let bars: Vec<ProgressBar> = urls
+        .iter()
         .map(|url| {
+            let name = url.rsplit('/').next().unwrap_or("file.bin").to_string();
+            let pb = multi.add(ProgressBar::new(0));
+            pb.set_style(style.clone());
+            pb.set_prefix(name);
+            pb
+        })
+        .collect();
+
+    let results: Vec<Result<()>> = stream::iter(urls.iter().zip(bars.iter()).enumerate())
+        .map(|(_, (url, pb))| {
             let client = client.clone();
+            let url = url.clone();
             let dest = dest_dir.join(url.rsplit('/').next().unwrap_or("file.bin"));
-            async move { download_file(&client, &url, &dest).await }
+            async move { download_file_with_progress(&client, &url, &dest, Some(pb)).await }
         })
         .buffer_unordered(concurrency.max(1))
         .collect()
         .await;
+
     for r in results {
         r?;
     }
