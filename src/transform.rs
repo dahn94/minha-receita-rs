@@ -443,19 +443,12 @@ pub async fn consolidate(ctx: &SessionContext) -> Result<datafusion::dataframe::
 ///   support sorting on struct columns at planning, so we drop `with_sort_by`
 ///   entirely. The partition-by alone satisfies the column-store layout
 ///   requirements; sorting was only a downstream-query optimization.
-pub async fn write_partitioned(df: datafusion::dataframe::DataFrame, out_dir: &Path) -> Result<()> {
+fn build_parquet_opts() -> datafusion::common::config::TableParquetOptions {
     use datafusion::common::config::{ParquetColumnOptions, TableParquetOptions};
-    use datafusion::dataframe::DataFrameWriteOptions;
-
-    let target = out_dir.join("companies");
-    std::fs::create_dir_all(&target)?;
-
     let mut props = TableParquetOptions::new();
     props.global.compression = Some("zstd(3)".to_string());
     props.global.statistics_enabled = Some("page".to_string());
     props.global.bloom_filter_on_write = true;
-
-    // Bloom filter only on cnpj to limit overhead.
     let cnpj_opts = ParquetColumnOptions {
         bloom_filter_enabled: Some(true),
         ..Default::default()
@@ -463,13 +456,83 @@ pub async fn write_partitioned(df: datafusion::dataframe::DataFrame, out_dir: &P
     props
         .column_specific_options
         .insert("cnpj".to_string(), cnpj_opts);
+    props
+}
+
+pub async fn write_partitioned(df: datafusion::dataframe::DataFrame, out_dir: &Path) -> Result<()> {
+    use datafusion::dataframe::DataFrameWriteOptions;
+    use datafusion::prelude::*;
+
+    let target = out_dir.join("companies");
+    std::fs::create_dir_all(&target)?;
+
+    // Two-pass write to avoid Arrow's i32 offset overflow when DataFusion's
+    // partition-by writer accumulates large UFs (e.g. SP) into a single
+    // per-partition builder. Pass 1 streams the consolidation result to a
+    // single unpartitioned parquet (each batch ~8K rows, no cross-batch
+    // accumulation). Pass 2 reads it back and writes one UF at a time, so
+    // each file stream's offsets stay bounded by that UF's bytes.
+    let staging_tmp = tempfile::TempDir::new()?;
+    let staging = staging_tmp.path().join("staging");
+    std::fs::create_dir_all(&staging)?;
 
     df.write_parquet(
-        target.to_str().unwrap(),
-        DataFrameWriteOptions::new().with_partition_by(vec!["uf".to_string()]),
-        Some(props),
+        staging.to_str().unwrap(),
+        DataFrameWriteOptions::new(),
+        Some(build_parquet_opts()),
     )
     .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_parquet(
+        "staging",
+        staging.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await?;
+
+    use arrow::array::Array;
+    let uf_batches = ctx
+        .sql(
+            "SELECT DISTINCT CAST(uf AS VARCHAR) AS uf \
+             FROM staging WHERE uf IS NOT NULL ORDER BY uf",
+        )
+        .await?
+        .collect()
+        .await?;
+    let mut ufs: Vec<String> = Vec::new();
+    for b in &uf_batches {
+        let raw = b.column(0).clone();
+        let col = arrow::compute::cast(&raw, &arrow::datatypes::DataType::Utf8)?;
+        let col = col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("cast to Utf8 yields StringArray");
+        for i in 0..col.len() {
+            if !col.is_null(i) {
+                ufs.push(col.value(i).to_string());
+            }
+        }
+    }
+
+    for uf in &ufs {
+        let escaped = uf.replace('\'', "''");
+        let part_df = ctx
+            .sql(&format!(
+                "SELECT * EXCEPT(uf) FROM staging WHERE uf = '{}'",
+                escaped
+            ))
+            .await?;
+        let uf_dir = target.join(format!("uf={}", uf));
+        std::fs::create_dir_all(&uf_dir)?;
+        part_df
+            .write_parquet(
+                uf_dir.to_str().unwrap(),
+                DataFrameWriteOptions::new(),
+                Some(build_parquet_opts()),
+            )
+            .await?;
+    }
     Ok(())
 }
 
