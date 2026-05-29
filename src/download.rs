@@ -178,7 +178,7 @@ pub async fn fetch_ibge_url(client: &reqwest::Client) -> Result<String> {
 }
 
 pub const RECEITA_BASE_URL: &str =
-    "https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/";
+    "https://dadosabertos.rfb.gov.br/CNPJ/dados_abertos_cnpj/";
 
 #[cfg(test)]
 mod tests {
