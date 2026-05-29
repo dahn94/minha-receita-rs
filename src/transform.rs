@@ -244,13 +244,44 @@ pub fn extract_all(zip_dir: &Path, out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// SQL expression that safely parses a raw `YYYYMMDD` string column into a
+/// `DATE`, yielding `NULL` for every missing or malformed token.
+///
+/// DF 44 has no `try_to_date`, and `to_date` is non-fallible: a single
+/// unparseable row aborts the whole query. The raw Receita feed contains a
+/// zoo of bad tokens — `NULL`, `""`, `"00000000"`, the bare `"0"`, and the
+/// occasional out-of-range date (e.g. month 13). Rather than enumerate
+/// sentinels (a losing game), we reformat to ISO `YYYY-MM-DD` and `try_cast`
+/// to `DATE`, which returns `NULL` instead of erroring on anything that
+/// doesn't parse. `concat` drops NULL args, so a NULL/short input becomes a
+/// non-date string that `try_cast` turns into `NULL`.
+fn safe_date_expr(col: &str) -> String {
+    format!(
+        "try_cast(concat(substr({col}, 1, 4), '-', substr({col}, 5, 2), '-', substr({col}, 7, 2)) AS DATE)"
+    )
+}
+
+/// Fill the `{d_*}` date placeholders shared by both consolidation templates
+/// with the safe date expressions for their respective raw columns. Kept as a
+/// single function so the two builders can never drift apart.
+fn fill_date_exprs(template: &str) -> String {
+    template
+        .replace("{d_entrada}", &safe_date_expr("s.data_entrada_sociedade_raw"))
+        .replace("{d_sit_cad}", &safe_date_expr("est.data_situacao_cadastral_raw"))
+        .replace("{d_inicio}", &safe_date_expr("est.data_inicio_atividade_raw"))
+        .replace("{d_op_simples}", &safe_date_expr("sim.data_opcao_pelo_simples_raw"))
+        .replace("{d_ex_simples}", &safe_date_expr("sim.data_exclusao_do_simples_raw"))
+        .replace("{d_op_mei}", &safe_date_expr("sim.data_opcao_pelo_mei_raw"))
+        .replace("{d_ex_mei}", &safe_date_expr("sim.data_exclusao_do_mei_raw"))
+}
+
 /// Single SQL that joins all raw tables and produces one row per estabelecimento
 /// with `qsa` and `cnaes_secundarios` as arrays of structs.
 ///
 /// Deviations from the original plan (DataFusion 44 compatibility):
-/// - Date parsing uses `to_date(s, '%Y%m%d')` (chrono strftime), wrapped in a
-///   CASE that returns NULL for empty / "00000000" inputs. DF 44 has no
-///   `try_to_date` and a literal `'yyyyMMdd'` is rejected by `to_date`.
+/// - Date parsing reformats the raw `YYYYMMDD` string to ISO and `try_cast`s
+///   to `DATE` (see [`safe_date_expr`]); DF 44 has no `try_to_date` and the
+///   non-fallible `to_date` would abort the query on any malformed token.
 /// - The `flatten()` around `string_to_array(...)` was dropped — the function
 ///   already returns a 1-D list.
 /// - The `cnaes_secundarios` CTE no longer uses correlated
@@ -262,7 +293,7 @@ pub fn extract_all(zip_dir: &Path, out_dir: &Path) -> Result<()> {
 ///   distinct from `false`.
 /// - `array_remove(make_array(...), NULL)` replaces the original
 ///   `array[..]` literal syntax (DF 44 prefers `make_array`).
-pub const CONSOLIDATION_SQL: &str = r#"
+const CONSOLIDATION_SQL_TEMPLATE: &str = r#"
 WITH
 socios_agg AS (
     SELECT
@@ -273,13 +304,7 @@ socios_agg AS (
             'cnpj_cpf_do_socio', s.cnpj_cpf_do_socio,
             'codigo_qualificacao_socio', try_cast(s.codigo_qualificacao_socio AS INT),
             'qualificacao_socio', qs.descricao,
-            'data_entrada_sociedade', CASE
-                WHEN s.data_entrada_sociedade_raw IS NULL
-                  OR length(s.data_entrada_sociedade_raw) = 0
-                  OR s.data_entrada_sociedade_raw = '00000000'
-                THEN NULL
-                ELSE to_date(s.data_entrada_sociedade_raw, '%Y%m%d')
-            END,
+            'data_entrada_sociedade', {d_entrada},
             'codigo_pais', s.codigo_pais,
             'pais', ps.descricao,
             'cpf_representante_legal', s.cpf_representante_legal,
@@ -323,21 +348,9 @@ SELECT
         WHEN '08' THEN 'BAIXADA'
         ELSE est.situacao_cadastral_codigo
     END AS situacao_cadastral,
-    CASE
-        WHEN est.data_situacao_cadastral_raw IS NULL
-          OR length(est.data_situacao_cadastral_raw) = 0
-          OR est.data_situacao_cadastral_raw = '00000000'
-        THEN NULL
-        ELSE to_date(est.data_situacao_cadastral_raw, '%Y%m%d')
-    END AS data_situacao_cadastral,
+    {d_sit_cad} AS data_situacao_cadastral,
     named_struct('codigo', est.motivo_situacao_cadastral, 'descricao', mot.descricao) AS motivo_situacao_cadastral,
-    CASE
-        WHEN est.data_inicio_atividade_raw IS NULL
-          OR length(est.data_inicio_atividade_raw) = 0
-          OR est.data_inicio_atividade_raw = '00000000'
-        THEN NULL
-        ELSE to_date(est.data_inicio_atividade_raw, '%Y%m%d')
-    END AS data_inicio_atividade,
+    {d_inicio} AS data_inicio_atividade,
     named_struct('codigo', est.cnae_fiscal_principal, 'descricao', cf.descricao) AS cnae_fiscal,
     csr.cnaes_secundarios,
     named_struct('codigo', emp.natureza_juridica, 'descricao', nat.descricao) AS natureza_juridica,
@@ -381,37 +394,13 @@ SELECT
     CASE WHEN sim.opcao_pelo_simples_raw = 'S' THEN true
          WHEN sim.opcao_pelo_simples_raw = 'N' THEN false
          ELSE NULL END AS opcao_pelo_simples,
-    CASE
-        WHEN sim.data_opcao_pelo_simples_raw IS NULL
-          OR length(sim.data_opcao_pelo_simples_raw) = 0
-          OR sim.data_opcao_pelo_simples_raw = '00000000'
-        THEN NULL
-        ELSE to_date(sim.data_opcao_pelo_simples_raw, '%Y%m%d')
-    END AS data_opcao_pelo_simples,
-    CASE
-        WHEN sim.data_exclusao_do_simples_raw IS NULL
-          OR length(sim.data_exclusao_do_simples_raw) = 0
-          OR sim.data_exclusao_do_simples_raw = '00000000'
-        THEN NULL
-        ELSE to_date(sim.data_exclusao_do_simples_raw, '%Y%m%d')
-    END AS data_exclusao_do_simples,
+    {d_op_simples} AS data_opcao_pelo_simples,
+    {d_ex_simples} AS data_exclusao_do_simples,
     CASE WHEN sim.opcao_pelo_mei_raw = 'S' THEN true
          WHEN sim.opcao_pelo_mei_raw = 'N' THEN false
          ELSE NULL END AS opcao_pelo_mei,
-    CASE
-        WHEN sim.data_opcao_pelo_mei_raw IS NULL
-          OR length(sim.data_opcao_pelo_mei_raw) = 0
-          OR sim.data_opcao_pelo_mei_raw = '00000000'
-        THEN NULL
-        ELSE to_date(sim.data_opcao_pelo_mei_raw, '%Y%m%d')
-    END AS data_opcao_pelo_mei,
-    CASE
-        WHEN sim.data_exclusao_do_mei_raw IS NULL
-          OR length(sim.data_exclusao_do_mei_raw) = 0
-          OR sim.data_exclusao_do_mei_raw = '00000000'
-        THEN NULL
-        ELSE to_date(sim.data_exclusao_do_mei_raw, '%Y%m%d')
-    END AS data_exclusao_do_mei
+    {d_op_mei} AS data_opcao_pelo_mei,
+    {d_ex_mei} AS data_exclusao_do_mei
 FROM estabelecimentos est
 LEFT JOIN empresas emp ON emp.cnpj_basico = est.cnpj_basico
 LEFT JOIN cnaes cf ON cf.codigo = est.cnae_fiscal_principal
@@ -426,8 +415,13 @@ LEFT JOIN cnaes_sec_resolved csr ON csr.cnpj = concat(est.cnpj_basico, est.cnpj_
 LEFT JOIN simples sim ON sim.cnpj_basico = est.cnpj_basico
 "#;
 
+/// The whole-dataset consolidation SQL with its date slots filled in.
+pub fn consolidation_sql() -> String {
+    fill_date_exprs(CONSOLIDATION_SQL_TEMPLATE)
+}
+
 pub async fn consolidate(ctx: &SessionContext) -> Result<datafusion::dataframe::DataFrame> {
-    Ok(ctx.sql(CONSOLIDATION_SQL).await?)
+    Ok(ctx.sql(&consolidation_sql()).await?)
 }
 
 /// All Brazilian state codes that estabelecimentos uses, plus EX (exterior).
@@ -500,19 +494,9 @@ pub fn current_profile() -> ExecutionProfile {
     pick_profile(memory_gb)
 }
 
-/// Build the consolidation SQL restricted to one UF × chunk slice.
-///
-/// The slice is defined by a `chunk_basicos` CTE that selects only the
-/// `cnpj_basico` values whose `MOD(cast(cnpj_basico AS BIGINT), n_chunks)
-/// == chunk` and whose estabelecimento has `uf = '<UF>'`. All large source
-/// tables (`socios`, `empresas`, `simples`, both `estabelecimentos`
-/// occurrences) get an INNER JOIN on `chunk_basicos` so the hash agg and
-/// join builders only see the slice's rows. Output excludes the `uf` column
-/// because the writer puts the file under `companies/uf=<UF>/`.
-pub fn chunked_consolidation_sql(uf: &str, chunk: u32, n_chunks: u32) -> String {
-    let uf_escaped = uf.replace('\'', "''");
-    format!(
-        r#"
+/// Template for [`chunked_consolidation_sql`]. The `{uf_escaped}`,
+/// `{n_chunks}`, `{chunk}` and `{d_*}` date slots are filled at call time.
+const CHUNKED_CONSOLIDATION_SQL_TEMPLATE: &str = r#"
 WITH chunk_basicos AS (
     SELECT DISTINCT cnpj_basico
     FROM estabelecimentos
@@ -528,13 +512,7 @@ socios_agg AS (
             'cnpj_cpf_do_socio', s.cnpj_cpf_do_socio,
             'codigo_qualificacao_socio', try_cast(s.codigo_qualificacao_socio AS INT),
             'qualificacao_socio', qs.descricao,
-            'data_entrada_sociedade', CASE
-                WHEN s.data_entrada_sociedade_raw IS NULL
-                  OR length(s.data_entrada_sociedade_raw) = 0
-                  OR s.data_entrada_sociedade_raw = '00000000'
-                THEN NULL
-                ELSE to_date(s.data_entrada_sociedade_raw, '%Y%m%d')
-            END,
+            'data_entrada_sociedade', {d_entrada},
             'codigo_pais', s.codigo_pais,
             'pais', ps.descricao,
             'cpf_representante_legal', s.cpf_representante_legal,
@@ -589,21 +567,9 @@ SELECT
         WHEN '08' THEN 'BAIXADA'
         ELSE est.situacao_cadastral_codigo
     END AS situacao_cadastral,
-    CASE
-        WHEN est.data_situacao_cadastral_raw IS NULL
-          OR length(est.data_situacao_cadastral_raw) = 0
-          OR est.data_situacao_cadastral_raw = '00000000'
-        THEN NULL
-        ELSE to_date(est.data_situacao_cadastral_raw, '%Y%m%d')
-    END AS data_situacao_cadastral,
+    {d_sit_cad} AS data_situacao_cadastral,
     named_struct('codigo', est.motivo_situacao_cadastral, 'descricao', mot.descricao) AS motivo_situacao_cadastral,
-    CASE
-        WHEN est.data_inicio_atividade_raw IS NULL
-          OR length(est.data_inicio_atividade_raw) = 0
-          OR est.data_inicio_atividade_raw = '00000000'
-        THEN NULL
-        ELSE to_date(est.data_inicio_atividade_raw, '%Y%m%d')
-    END AS data_inicio_atividade,
+    {d_inicio} AS data_inicio_atividade,
     named_struct('codigo', est.cnae_fiscal_principal, 'descricao', cf.descricao) AS cnae_fiscal,
     csr.cnaes_secundarios,
     named_struct('codigo', emp.natureza_juridica, 'descricao', nat.descricao) AS natureza_juridica,
@@ -646,37 +612,13 @@ SELECT
     CASE WHEN sim.opcao_pelo_simples_raw = 'S' THEN true
          WHEN sim.opcao_pelo_simples_raw = 'N' THEN false
          ELSE NULL END AS opcao_pelo_simples,
-    CASE
-        WHEN sim.data_opcao_pelo_simples_raw IS NULL
-          OR length(sim.data_opcao_pelo_simples_raw) = 0
-          OR sim.data_opcao_pelo_simples_raw = '00000000'
-        THEN NULL
-        ELSE to_date(sim.data_opcao_pelo_simples_raw, '%Y%m%d')
-    END AS data_opcao_pelo_simples,
-    CASE
-        WHEN sim.data_exclusao_do_simples_raw IS NULL
-          OR length(sim.data_exclusao_do_simples_raw) = 0
-          OR sim.data_exclusao_do_simples_raw = '00000000'
-        THEN NULL
-        ELSE to_date(sim.data_exclusao_do_simples_raw, '%Y%m%d')
-    END AS data_exclusao_do_simples,
+    {d_op_simples} AS data_opcao_pelo_simples,
+    {d_ex_simples} AS data_exclusao_do_simples,
     CASE WHEN sim.opcao_pelo_mei_raw = 'S' THEN true
          WHEN sim.opcao_pelo_mei_raw = 'N' THEN false
          ELSE NULL END AS opcao_pelo_mei,
-    CASE
-        WHEN sim.data_opcao_pelo_mei_raw IS NULL
-          OR length(sim.data_opcao_pelo_mei_raw) = 0
-          OR sim.data_opcao_pelo_mei_raw = '00000000'
-        THEN NULL
-        ELSE to_date(sim.data_opcao_pelo_mei_raw, '%Y%m%d')
-    END AS data_opcao_pelo_mei,
-    CASE
-        WHEN sim.data_exclusao_do_mei_raw IS NULL
-          OR length(sim.data_exclusao_do_mei_raw) = 0
-          OR sim.data_exclusao_do_mei_raw = '00000000'
-        THEN NULL
-        ELSE to_date(sim.data_exclusao_do_mei_raw, '%Y%m%d')
-    END AS data_exclusao_do_mei
+    {d_op_mei} AS data_opcao_pelo_mei,
+    {d_ex_mei} AS data_exclusao_do_mei
 FROM estabelecimentos est
 INNER JOIN chunk_basicos cb ON cb.cnpj_basico = est.cnpj_basico
 LEFT JOIN chunk_empresas emp ON emp.cnpj_basico = est.cnpj_basico
@@ -691,8 +633,23 @@ LEFT JOIN socios_agg sa ON sa.cnpj_basico = est.cnpj_basico
 LEFT JOIN cnaes_sec_resolved csr ON csr.cnpj = concat(est.cnpj_basico, est.cnpj_ordem, est.cnpj_dv)
 LEFT JOIN chunk_simples sim ON sim.cnpj_basico = est.cnpj_basico
 WHERE est.uf = '{uf_escaped}'
-"#
-    )
+"#;
+
+/// Build the consolidation SQL restricted to one UF × chunk slice.
+///
+/// The slice is defined by a `chunk_basicos` CTE that selects only the
+/// `cnpj_basico` values whose `MOD(cast(cnpj_basico AS BIGINT), n_chunks)
+/// == chunk` and whose estabelecimento has `uf = '<UF>'`. All large source
+/// tables (`socios`, `empresas`, `simples`, both `estabelecimentos`
+/// occurrences) get an INNER JOIN on `chunk_basicos` so the hash agg and
+/// join builders only see the slice's rows. Output excludes the `uf` column
+/// because the writer puts the file under `companies/uf=<UF>/`.
+pub fn chunked_consolidation_sql(uf: &str, chunk: u32, n_chunks: u32) -> String {
+    let uf_escaped = uf.replace('\'', "''");
+    fill_date_exprs(CHUNKED_CONSOLIDATION_SQL_TEMPLATE)
+        .replace("{n_chunks}", &n_chunks.to_string())
+        .replace("{chunk}", &chunk.to_string())
+        .replace("{uf_escaped}", &uf_escaped)
 }
 
 /// Write the consolidated DataFrame as Parquet, partitioned by `uf`, under
@@ -1134,6 +1091,55 @@ mod tests {
             }
             None
         })
+    }
+
+    /// Reproduce the production failure: a raw date token of "0" (length 1)
+    /// slips past the old `length=0 / ='00000000'` guard and crashes the
+    /// non-fallible `to_date`. Also pins the safe replacement's behavior.
+    #[tokio::test]
+    async fn safe_date_handles_all_raw_tokens() {
+        use arrow::array::{Array, StringArray};
+        let ctx = datafusion::prelude::SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Utf8, true)]));
+        let batch = arrow::array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                Some("20230115"), // valid
+                Some("0"),        // the production crasher
+                Some(""),         // empty
+                Some("00000000"), // sentinel
+                Some("20231345"), // 8 digits but month 13 / day 45
+                None,             // NULL
+            ]))],
+        )
+        .unwrap();
+        ctx.register_batch("t", batch).unwrap();
+
+        // The old expression aborts the whole query on the "0" row.
+        let old = ctx
+            .sql("SELECT to_date(d, '%Y%m%d') FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(old.is_err(), "expected to_date to blow up on '0'");
+
+        // The fix: reformat to ISO and try_cast — NULL for every bad token,
+        // a real date for the valid one, no query-level error.
+        let df = ctx
+            .sql(&format!("SELECT {} AS d FROM t", safe_date_expr("d")))
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Date32Array>()
+            .unwrap();
+        assert!(col.is_valid(0), "valid date should parse");
+        for i in 1..6 {
+            assert!(col.is_null(i), "row {i} should be NULL");
+        }
     }
 
     #[test]

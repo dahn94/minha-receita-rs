@@ -17,6 +17,27 @@ async fn init_writes_period_file() {
     assert!(td.path().join("companies").exists());
 }
 
+#[tokio::test]
+async fn init_refuses_when_already_initialized() {
+    let td = TempDir::new().unwrap();
+    let zip_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/2026-01.zip");
+    let ibge = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/tabmun.csv");
+
+    // First run succeeds and produces companies/.
+    lifecycle::init_from_local(td.path(), &zip_src, &ibge, "2026-01".parse().unwrap())
+        .await
+        .unwrap();
+
+    // Second run must bail instead of re-transforming into the existing dir.
+    let err = lifecycle::init_from_local(td.path(), &zip_src, &ibge, "2026-01".parse().unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("já existe"),
+        "expected an already-initialized error, got: {err}"
+    );
+}
+
 #[test]
 fn read_period_file_works() {
     let td = TempDir::new().unwrap();
