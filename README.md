@@ -197,10 +197,11 @@ minha-receita-rs lookup 33683111000280 --format json --output empresa.jsonl
 
 ## 6. Variáveis de ambiente
 
-| Variável   | Uso |
+| Variável        | Uso |
 |---|---|
-| `MR_DATA`  | Diretório raiz do dado local (sobrescreve o padrão do SO). |
-| `RUST_LOG` | Verbosidade dos logs (`error`, `warn`, `info`, `debug`, `trace`). Padrão `info`. |
+| `MR_DATA`       | Diretório raiz do dado local (sobrescreve o padrão do SO). |
+| `RUST_LOG`      | Verbosidade dos logs (`error`, `warn`, `info`, `debug`, `trace`). Padrão `info`. |
+| `MR_MEMORY_GB`  | Força um perfil de memória durante `init`/`transform`. Por padrão a RAM total é detectada e usada pra escolher chunks por UF + paralelismo. Use se quiser limitar (ex.: `MR_MEMORY_GB=8` num laptop disputando RAM). |
 
 Exemplos:
 

@@ -439,8 +439,66 @@ pub const BR_UFS: &[&str] = &[
 /// Chunks per UF. The hash agg builders in socios_agg / cnaes_sec_resolved
 /// have i32 offsets; for SP (worst case ~3M cnpj_basicos × ~1.4 KB per qsa
 /// list-of-struct row) a single chunk would overflow. 4 chunks keep every UF
-/// comfortably below the 2 GB Arrow limit.
+/// comfortably below the 2 GB Arrow limit. Tunable per machine via
+/// [`pick_profile`].
 pub const CHUNKS_PER_UF: u32 = 4;
+
+/// Knobs that control memory pressure during transform. Driven by available
+/// RAM + CPU count; can be overridden via the `MR_MEMORY_GB` env var.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionProfile {
+    pub chunks_per_uf: u32,
+    pub target_partitions: usize,
+    pub batch_size: usize,
+    pub memory_gb: u32,
+}
+
+/// Read total system RAM in GB. Falls back to 8 if detection fails so we
+/// pick the safe profile by default.
+pub fn detect_memory_gb() -> u32 {
+    use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+    let sys = System::new_with_specifics(
+        RefreshKind::new().with_memory(MemoryRefreshKind::everything()),
+    );
+    let bytes = sys.total_memory();
+    if bytes == 0 {
+        8
+    } else {
+        ((bytes / 1_000_000_000).max(1)) as u32
+    }
+}
+
+/// Map detected RAM to a chunking/parallelism profile. Tiers were sized so
+/// the largest worst-case slice (SP's qsa list) stays below Arrow's 2 GB
+/// i32 offset ceiling and the resident set stays under ~50% of total RAM.
+pub fn pick_profile(memory_gb: u32) -> ExecutionProfile {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let (chunks_per_uf, partitions_mult, batch_size) = match memory_gb {
+        0..=7 => (8u32, 1usize, 1024usize), // < 8 GB: conservative
+        8..=11 => (4, 1, 2048),             // 8–11 GB
+        12..=15 => (4, 2, 2048),            // 12–15 GB
+        16..=23 => (2, 2, 4096),            // 16–23 GB
+        _ => (2, 4, 8192),                  // 24+ GB
+    };
+    let target_partitions = (cpus * partitions_mult).clamp(2, 64);
+    ExecutionProfile {
+        chunks_per_uf,
+        target_partitions,
+        batch_size,
+        memory_gb,
+    }
+}
+
+/// Resolve the active profile: env override → detected → tier mapping.
+pub fn current_profile() -> ExecutionProfile {
+    let memory_gb = std::env::var("MR_MEMORY_GB")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or_else(detect_memory_gb);
+    pick_profile(memory_gb)
+}
 
 /// Build the consolidation SQL restricted to one UF × chunk slice.
 ///
@@ -757,16 +815,20 @@ pub async fn run(zip_dir: &Path, ibge_csv: &Path, out_dir: &Path) -> Result<()> 
     );
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
+    let profile = current_profile();
+    eprintln!(
+        "==> Perfil: RAM={}GB → chunks={}/UF, target_partitions={}, batch_size={}",
+        profile.memory_gb, profile.chunks_per_uf, profile.target_partitions, profile.batch_size,
+    );
+
     spinner.set_message(format!("Extraindo ZIPs de {}", zip_dir.display()));
     extract_all(zip_dir, &ext)?;
     spinner.set_message("Organizando arquivos por tipo");
     organize_by_kind(&ext, &staging)?;
 
-    // Low target_partitions + small batch_size = bounded per-task memory so the
-    // pipeline fits in ~8 GB RAM.
     let config = SessionConfig::new()
-        .with_target_partitions(4)
-        .with_batch_size(2048);
+        .with_target_partitions(profile.target_partitions)
+        .with_batch_size(profile.batch_size);
     let ctx = SessionContext::new_with_config(config);
     spinner.set_message("Registrando tabelas-fonte");
     register_sources(&ctx, &staging).await?;
@@ -775,18 +837,18 @@ pub async fn run(zip_dir: &Path, ibge_csv: &Path, out_dir: &Path) -> Result<()> 
     let target = out_dir.join("companies");
     std::fs::create_dir_all(&target)?;
     let parquet_opts = build_parquet_opts();
-    let total_jobs = BR_UFS.len() * CHUNKS_PER_UF as usize;
+    let total_jobs = BR_UFS.len() * profile.chunks_per_uf as usize;
     let mut done = 0_usize;
     for uf in BR_UFS {
         let uf_dir = target.join(format!("uf={}", uf));
         std::fs::create_dir_all(&uf_dir)?;
-        for chunk in 0..CHUNKS_PER_UF {
+        for chunk in 0..profile.chunks_per_uf {
             done += 1;
             spinner.set_message(format!(
                 "Consolidando {}/{} (UF={} chunk={})",
                 done, total_jobs, uf, chunk
             ));
-            let sql = chunked_consolidation_sql(uf, chunk, CHUNKS_PER_UF);
+            let sql = chunked_consolidation_sql(uf, chunk, profile.chunks_per_uf);
             let df = ctx.sql(&sql).await?;
             df.write_parquet(
                 uf_dir.to_str().unwrap(),
