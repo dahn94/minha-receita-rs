@@ -24,6 +24,7 @@ indicatif = "0.17"
 scraper = "0.20"
 dirs = "5"
 tempfile = "3"
+quick-xml = "0.36"
 
 [dev-dependencies]
 mockito = "1"

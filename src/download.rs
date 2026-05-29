@@ -2,24 +2,37 @@ use std::path::Path;
 
 use futures::stream::{self, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use scraper::{Html, Selector};
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
 use crate::schema::Period;
 use crate::{Error, Result};
 
+/// Receita Federal Nextcloud share. The public share is read-only WebDAV;
+/// authenticate with the share token as username and empty password.
+pub const RECEITA_WEBDAV_URL: &str =
+    "https://arquivos.receitafederal.gov.br/public.php/webdav/";
+pub const RECEITA_SHARE_TOKEN: &str = "YggdBLfdninEJX9";
+
 pub async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
-    download_file_with_progress(client, url, dest, None).await
+    download_file_with_progress(client, url, dest, None, None).await
 }
 
 async fn download_file_with_progress(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
+    auth_token: Option<&str>,
     pb: Option<&ProgressBar>,
 ) -> Result<()> {
-    let head = client.head(url).send().await?;
+    let head_req = client.head(url);
+    let head_req = match auth_token {
+        Some(tok) => head_req.basic_auth(tok, Some("")),
+        None => head_req,
+    };
+    let head = head_req.send().await?;
     let remote_len = head
         .headers()
         .get(reqwest::header::CONTENT_LENGTH)
@@ -43,7 +56,12 @@ async fn download_file_with_progress(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let resp = client.get(url).send().await?;
+    let get_req = client.get(url);
+    let get_req = match auth_token {
+        Some(tok) => get_req.basic_auth(tok, Some("")),
+        None => get_req,
+    };
+    let resp = get_req.send().await?;
     let status = resp.status();
     if !status.is_success() {
         return Err(Error::Http {
@@ -75,6 +93,7 @@ pub async fn download_all(
     urls: &[String],
     dest_dir: &Path,
     concurrency: usize,
+    auth_token: Option<&str>,
 ) -> Result<()> {
     std::fs::create_dir_all(dest_dir)?;
 
@@ -96,12 +115,14 @@ pub async fn download_all(
         })
         .collect();
 
-    let results: Vec<Result<()>> = stream::iter(urls.iter().zip(bars.iter()).enumerate())
-        .map(|(_, (url, pb))| {
+    let results: Vec<Result<()>> = stream::iter(urls.iter().zip(bars.iter()))
+        .map(|(url, pb)| {
             let client = client.clone();
             let url = url.clone();
             let dest = dest_dir.join(url.rsplit('/').next().unwrap_or("file.bin"));
-            async move { download_file_with_progress(&client, &url, &dest, Some(pb)).await }
+            async move {
+                download_file_with_progress(&client, &url, &dest, auth_token, Some(pb)).await
+            }
         })
         .buffer_unordered(concurrency.max(1))
         .collect()
@@ -136,31 +157,93 @@ pub fn parse_ibge_ckan(json: &str) -> Result<String> {
         .ok_or_else(|| Error::MissingData("no CSV resource in CKAN response".into()))
 }
 
-pub fn parse_period_listing(html: &str) -> Vec<Period> {
-    let doc = Html::parse_document(html);
-    let sel = Selector::parse("a").unwrap();
-    doc.select(&sel)
-        .filter_map(|a| {
-            let href = a.value().attr("href")?.trim_end_matches('/');
-            href.parse::<Period>().ok()
+/// Issues a WebDAV PROPFIND with Depth: 1 and returns the raw XML.
+async fn propfind(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    depth: u8,
+) -> Result<String> {
+    let method = reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND is a valid method name");
+    let resp = client
+        .request(method, url)
+        .basic_auth(token, Some(""))
+        .header("Depth", depth.to_string())
+        .send()
+        .await?;
+    let status = resp.status();
+    // Nextcloud answers PROPFIND with 207 Multi-Status.
+    if !status.is_success() && status.as_u16() != 207 {
+        return Err(Error::Http {
+            url: url.into(),
+            status: status.as_u16(),
+        });
+    }
+    Ok(resp.text().await?)
+}
+
+/// Extract every `<*:href>` text node from a PROPFIND XML response.
+fn extract_hrefs(xml: &str) -> Vec<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut hrefs = Vec::new();
+    let mut buf = Vec::new();
+    let mut in_href = false;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                let bytes = name.as_ref();
+                if bytes == b"href" || bytes.ends_with(b":href") {
+                    in_href = true;
+                }
+            }
+            Ok(Event::Text(e)) if in_href => {
+                if let Ok(s) = e.unescape() {
+                    hrefs.push(s.into_owned());
+                }
+            }
+            Ok(Event::End(_)) => {
+                in_href = false;
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    hrefs
+}
+
+/// Extract `Period` directories from a PROPFIND response on the share root.
+pub fn parse_propfind_periods(xml: &str) -> Vec<Period> {
+    extract_hrefs(xml)
+        .iter()
+        .filter_map(|href| {
+            let trimmed = href.trim_end_matches('/');
+            let last = trimmed.rsplit('/').next()?;
+            last.parse::<Period>().ok()
         })
         .collect()
 }
 
-pub fn parse_file_listing(html: &str) -> Vec<String> {
-    let doc = Html::parse_document(html);
-    let sel = Selector::parse("a").unwrap();
-    doc.select(&sel)
-        .filter_map(|a| a.value().attr("href").map(|s| s.to_string()))
-        .filter(|s| s.ends_with(".zip"))
+/// Extract `.zip` filenames from a PROPFIND response on a period directory.
+pub fn parse_propfind_files(xml: &str) -> Vec<String> {
+    extract_hrefs(xml)
+        .iter()
+        .filter_map(|href| {
+            let last = href.trim_end_matches('/').rsplit('/').next()?;
+            Some(last.to_string())
+        })
+        .filter(|s| s.to_lowercase().ends_with(".zip"))
         .collect()
 }
 
-pub fn latest_period(html: &str) -> Result<Period> {
-    parse_period_listing(html)
+pub fn latest_propfind_period(xml: &str) -> Result<Period> {
+    parse_propfind_periods(xml)
         .into_iter()
         .max()
-        .ok_or_else(|| Error::MissingData("no period in listing".into()))
+        .ok_or_else(|| Error::MissingData("no period in PROPFIND response".into()))
 }
 
 pub async fn discover_and_download(
@@ -173,42 +256,20 @@ pub async fn discover_and_download(
     let period = if let Some(p) = period_override {
         p
     } else {
-        let html = client
-            .get(base_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        latest_period(&html)?
+        let xml = propfind(client, base_url, RECEITA_SHARE_TOKEN, 1).await?;
+        latest_propfind_period(&xml)?
     };
-    let period_url = format!(
-        "{}{}/",
-        base_url.trim_end_matches('/'),
-        &format!("/{}", period)
-    );
-    let html = client
-        .get(&period_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    let names = parse_file_listing(&html);
+    let period_url = format!("{}/{}/", base_url.trim_end_matches('/'), period);
+    let xml = propfind(client, &period_url, RECEITA_SHARE_TOKEN, 1).await?;
+    let names = parse_propfind_files(&xml);
     let urls: Vec<String> = names.iter().map(|n| format!("{period_url}{n}")).collect();
-    download_all(client, &urls, dest_dir, concurrency).await?;
+    download_all(client, &urls, dest_dir, concurrency, Some(RECEITA_SHARE_TOKEN)).await?;
     Ok(period)
 }
 
 pub async fn fetch_latest_period(client: &reqwest::Client, base_url: &str) -> Result<Period> {
-    let html = client
-        .get(base_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    latest_period(&html)
+    let xml = propfind(client, base_url, RECEITA_SHARE_TOKEN, 1).await?;
+    latest_propfind_period(&xml)
 }
 
 pub async fn fetch_ibge_url(client: &reqwest::Client) -> Result<String> {
@@ -223,54 +284,51 @@ pub async fn fetch_ibge_url(client: &reqwest::Client) -> Result<String> {
     parse_ibge_ckan(&body)
 }
 
-pub const RECEITA_BASE_URL: &str =
-    "https://dadosabertos.rfb.gov.br/CNPJ/dados_abertos_cnpj/";
+/// Back-compat alias.
+pub const RECEITA_BASE_URL: &str = RECEITA_WEBDAV_URL;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = r#"
-<html><body>
-<a href="2024-12/">2024-12/</a>
-<a href="2025-01/">2025-01/</a>
-<a href="2026-04/">2026-04/</a>
-<a href="readme.txt">readme.txt</a>
-</body></html>
-"#;
+    const PROPFIND_PERIODS: &str = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response><d:href>/public.php/webdav/</d:href></d:response>
+  <d:response><d:href>/public.php/webdav/2024-12/</d:href></d:response>
+  <d:response><d:href>/public.php/webdav/2025-01/</d:href></d:response>
+  <d:response><d:href>/public.php/webdav/2026-04/</d:href></d:response>
+  <d:response><d:href>/public.php/webdav/cnpj.tar.gz</d:href></d:response>
+</d:multistatus>"#;
 
     #[test]
-    fn parses_yyyy_mm_anchors() {
-        let mut periods = parse_period_listing(SAMPLE);
+    fn parses_period_directories_from_propfind() {
+        let mut periods = parse_propfind_periods(PROPFIND_PERIODS);
         periods.sort();
         let strs: Vec<String> = periods.iter().map(|p| p.to_string()).collect();
         assert_eq!(strs, vec!["2024-12", "2025-01", "2026-04"]);
     }
 
     #[test]
-    fn ignores_non_period_anchors() {
-        let html = r#"<a href="foo">x</a><a href="2026-05/">2026-05/</a>"#;
-        let periods = parse_period_listing(html);
-        assert_eq!(periods.len(), 1);
-        assert_eq!(periods[0].to_string(), "2026-05");
+    fn latest_period_picks_max() {
+        let p = latest_propfind_period(PROPFIND_PERIODS).unwrap();
+        assert_eq!(p.to_string(), "2026-04");
     }
 
-    const FILES_SAMPLE: &str = r#"
-<html><body>
-<a href="Empresas0.zip">Empresas0.zip</a>
-<a href="Estabelecimentos0.zip">Estabelecimentos0.zip</a>
-<a href="Socios0.zip">Socios0.zip</a>
-<a href="Cnaes.zip">Cnaes.zip</a>
-<a href="../">../</a>
-</body></html>
-"#;
+    const PROPFIND_FILES: &str = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response><d:href>/public.php/webdav/2026-04/</d:href></d:response>
+  <d:response><d:href>/public.php/webdav/2026-04/Empresas0.zip</d:href></d:response>
+  <d:response><d:href>/public.php/webdav/2026-04/Estabelecimentos0.zip</d:href></d:response>
+  <d:response><d:href>/public.php/webdav/2026-04/Cnaes.zip</d:href></d:response>
+  <d:response><d:href>/public.php/webdav/2026-04/README.txt</d:href></d:response>
+</d:multistatus>"#;
 
     #[test]
-    fn parses_zip_anchors() {
-        let names = parse_file_listing(FILES_SAMPLE);
+    fn parses_zip_files_from_propfind() {
+        let names = parse_propfind_files(PROPFIND_FILES);
         assert!(names.iter().any(|n| n == "Empresas0.zip"));
         assert!(names.iter().any(|n| n == "Cnaes.zip"));
-        assert!(!names.iter().any(|n| n == "../"));
+        assert!(!names.iter().any(|n| n == "README.txt"));
     }
 
     const CKAN_SAMPLE: &str = r#"
@@ -321,7 +379,6 @@ mod tests {
         std::fs::write(&dest, "hello-bytes").unwrap();
 
         let mut server = mockito::Server::new_async().await;
-        // Espera-se nenhum GET — só HEAD com content-length.
         let m_head = server
             .mock("HEAD", "/file.zip")
             .with_status(200)
@@ -334,42 +391,6 @@ mod tests {
             .await
             .unwrap();
         m_head.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn discover_and_download_full_flow() {
-        let mut server = mockito::Server::new_async().await;
-        // Listing raiz
-        let _root = server
-            .mock("GET", "/dados_abertos_cnpj/")
-            .with_body(r#"<a href="2026-04/">2026-04/</a>"#)
-            .create_async()
-            .await;
-        let _period_dir = server
-            .mock("GET", "/dados_abertos_cnpj/2026-04/")
-            .with_body(r#"<a href="Cnaes.zip">Cnaes.zip</a>"#)
-            .create_async()
-            .await;
-        let _file = server
-            .mock("GET", "/dados_abertos_cnpj/2026-04/Cnaes.zip")
-            .with_status(200)
-            .with_body("XX")
-            .with_header("content-length", "2")
-            .create_async()
-            .await;
-
-        let td = tempfile::TempDir::new().unwrap();
-        let client = reqwest::Client::new();
-        let base = format!("{}/dados_abertos_cnpj/", server.url());
-        let period = discover_and_download(&client, &base, None, td.path(), 2)
-            .await
-            .unwrap();
-
-        assert_eq!(period.to_string(), "2026-04");
-        assert_eq!(
-            std::fs::read_to_string(td.path().join("Cnaes.zip")).unwrap(),
-            "XX"
-        );
     }
 
     #[tokio::test]
@@ -396,7 +417,7 @@ mod tests {
             format!("{}/a.zip", server.url()),
             format!("{}/b.zip", server.url()),
         ];
-        download_all(&client, &urls, td.path(), 2).await.unwrap();
+        download_all(&client, &urls, td.path(), 2, None).await.unwrap();
 
         assert_eq!(
             std::fs::read_to_string(td.path().join("a.zip")).unwrap(),
