@@ -11,6 +11,9 @@ pub enum Error {
     #[error("arquivo de dado ausente: {0}")]
     MissingData(String),
 
+    #[error("{0} já existe — use `update` para atualizar, ou apague o diretório para refazer do zero")]
+    AlreadyInitialized(String),
+
     #[error("HTTP {status}: {url}")]
     Http { url: String, status: u16 },
 

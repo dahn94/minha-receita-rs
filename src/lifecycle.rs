@@ -20,10 +20,7 @@ pub async fn init_from_local(
 ) -> Result<()> {
     let companies = root.join("companies");
     if companies.exists() {
-        return Err(Error::MissingData(format!(
-            "{} já existe — use `update` em vez de `init`",
-            companies.display()
-        )));
+        return Err(Error::AlreadyInitialized(companies.display().to_string()));
     }
     std::fs::create_dir_all(root)?;
     let zips = root.join("zips");
@@ -94,6 +91,17 @@ pub async fn init(root: &Path, period_override: Option<String>, concurrency: usi
         .user_agent("minha-receita-rs/0.1")
         .build()?;
     let period = period_override.map(|s| s.parse::<Period>()).transpose()?;
+
+    // Fail fast (before any network) if a previous run already produced
+    // `companies/`. Re-running `init` would re-transform and write a second
+    // set of Parquet files into the existing `uf=*/` dirs (DataFusion does
+    // not clean the target), duplicating rows. `update` is the supported way
+    // to refresh; deleting `companies/` is the way to force a clean redo.
+    let companies = root.join("companies");
+    if companies.exists() {
+        return Err(Error::AlreadyInitialized(companies.display().to_string()));
+    }
+
     let zips = root.join("zips");
     eprintln!("==> Baixando arquivos da Receita");
     let actual_period =
