@@ -430,6 +430,213 @@ pub async fn consolidate(ctx: &SessionContext) -> Result<datafusion::dataframe::
     Ok(ctx.sql(CONSOLIDATION_SQL).await?)
 }
 
+/// All Brazilian state codes that estabelecimentos uses, plus EX (exterior).
+pub const BR_UFS: &[&str] = &[
+    "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "EX", "GO", "MA", "MG", "MS", "MT", "PA",
+    "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO",
+];
+
+/// Chunks per UF. The hash agg builders in socios_agg / cnaes_sec_resolved
+/// have i32 offsets; for SP (worst case ~3M cnpj_basicos × ~1.4 KB per qsa
+/// list-of-struct row) a single chunk would overflow. 4 chunks keep every UF
+/// comfortably below the 2 GB Arrow limit.
+pub const CHUNKS_PER_UF: u32 = 4;
+
+/// Build the consolidation SQL restricted to one UF × chunk slice.
+///
+/// The slice is defined by a `chunk_basicos` CTE that selects only the
+/// `cnpj_basico` values whose `MOD(cast(cnpj_basico AS BIGINT), n_chunks)
+/// == chunk` and whose estabelecimento has `uf = '<UF>'`. All large source
+/// tables (`socios`, `empresas`, `simples`, both `estabelecimentos`
+/// occurrences) get an INNER JOIN on `chunk_basicos` so the hash agg and
+/// join builders only see the slice's rows. Output excludes the `uf` column
+/// because the writer puts the file under `companies/uf=<UF>/`.
+pub fn chunked_consolidation_sql(uf: &str, chunk: u32, n_chunks: u32) -> String {
+    let uf_escaped = uf.replace('\'', "''");
+    format!(
+        r#"
+WITH chunk_basicos AS (
+    SELECT DISTINCT cnpj_basico
+    FROM estabelecimentos
+    WHERE uf = '{uf_escaped}'
+      AND CAST(cnpj_basico AS BIGINT) % {n_chunks} = {chunk}
+),
+socios_agg AS (
+    SELECT
+        s.cnpj_basico,
+        array_agg(named_struct(
+            'identificador_de_socio', try_cast(s.identificador_de_socio AS INT),
+            'nome_socio', s.nome_socio,
+            'cnpj_cpf_do_socio', s.cnpj_cpf_do_socio,
+            'codigo_qualificacao_socio', try_cast(s.codigo_qualificacao_socio AS INT),
+            'qualificacao_socio', qs.descricao,
+            'data_entrada_sociedade', CASE
+                WHEN s.data_entrada_sociedade_raw IS NULL
+                  OR length(s.data_entrada_sociedade_raw) = 0
+                  OR s.data_entrada_sociedade_raw = '00000000'
+                THEN NULL
+                ELSE to_date(s.data_entrada_sociedade_raw, '%Y%m%d')
+            END,
+            'codigo_pais', s.codigo_pais,
+            'pais', ps.descricao,
+            'cpf_representante_legal', s.cpf_representante_legal,
+            'nome_representante_legal', s.nome_representante_legal,
+            'codigo_qualificacao_representante_legal', try_cast(s.codigo_qualificacao_representante_legal AS INT),
+            'qualificacao_representante_legal', qrl.descricao,
+            'codigo_faixa_etaria', try_cast(s.codigo_faixa_etaria AS INT)
+        )) AS qsa
+    FROM socios s
+    INNER JOIN chunk_basicos cb ON cb.cnpj_basico = s.cnpj_basico
+    LEFT JOIN qualificacoes qs ON qs.codigo = s.codigo_qualificacao_socio
+    LEFT JOIN qualificacoes qrl ON qrl.codigo = s.codigo_qualificacao_representante_legal
+    LEFT JOIN paises ps ON ps.codigo = s.codigo_pais
+    GROUP BY s.cnpj_basico
+),
+cnaes_sec_exploded AS (
+    SELECT
+        concat(est.cnpj_basico, est.cnpj_ordem, est.cnpj_dv) AS cnpj,
+        unnest(string_to_array(est.cnae_fiscal_secundaria, ',')) AS code
+    FROM estabelecimentos est
+    INNER JOIN chunk_basicos cb ON cb.cnpj_basico = est.cnpj_basico
+    WHERE est.uf = '{uf_escaped}'
+      AND est.cnae_fiscal_secundaria IS NOT NULL
+      AND length(est.cnae_fiscal_secundaria) > 0
+),
+cnaes_sec_resolved AS (
+    SELECT
+        e.cnpj,
+        array_agg(named_struct('codigo', c.codigo, 'descricao', c.descricao)) AS cnaes_secundarios
+    FROM cnaes_sec_exploded e
+    LEFT JOIN cnaes c ON c.codigo = e.code
+    GROUP BY e.cnpj
+),
+chunk_empresas AS (
+    SELECT e.* FROM empresas e
+    INNER JOIN chunk_basicos cb ON cb.cnpj_basico = e.cnpj_basico
+),
+chunk_simples AS (
+    SELECT s.* FROM simples s
+    INNER JOIN chunk_basicos cb ON cb.cnpj_basico = s.cnpj_basico
+)
+SELECT
+    concat(est.cnpj_basico, est.cnpj_ordem, est.cnpj_dv) AS cnpj,
+    est.cnpj_basico AS cnpj_raiz,
+    emp.razao_social,
+    est.nome_fantasia,
+    CASE est.situacao_cadastral_codigo
+        WHEN '01' THEN 'NULA'
+        WHEN '02' THEN 'ATIVA'
+        WHEN '03' THEN 'SUSPENSA'
+        WHEN '04' THEN 'INAPTA'
+        WHEN '08' THEN 'BAIXADA'
+        ELSE est.situacao_cadastral_codigo
+    END AS situacao_cadastral,
+    CASE
+        WHEN est.data_situacao_cadastral_raw IS NULL
+          OR length(est.data_situacao_cadastral_raw) = 0
+          OR est.data_situacao_cadastral_raw = '00000000'
+        THEN NULL
+        ELSE to_date(est.data_situacao_cadastral_raw, '%Y%m%d')
+    END AS data_situacao_cadastral,
+    named_struct('codigo', est.motivo_situacao_cadastral, 'descricao', mot.descricao) AS motivo_situacao_cadastral,
+    CASE
+        WHEN est.data_inicio_atividade_raw IS NULL
+          OR length(est.data_inicio_atividade_raw) = 0
+          OR est.data_inicio_atividade_raw = '00000000'
+        THEN NULL
+        ELSE to_date(est.data_inicio_atividade_raw, '%Y%m%d')
+    END AS data_inicio_atividade,
+    named_struct('codigo', est.cnae_fiscal_principal, 'descricao', cf.descricao) AS cnae_fiscal,
+    csr.cnaes_secundarios,
+    named_struct('codigo', emp.natureza_juridica, 'descricao', nat.descricao) AS natureza_juridica,
+    named_struct('codigo', emp.qualificacao_responsavel, 'descricao', qr.descricao) AS qualificacao_responsavel,
+    try_cast(replace(emp.capital_social_raw, ',', '.') AS DOUBLE) AS capital_social,
+    named_struct(
+        'codigo', emp.porte,
+        'descricao', CASE emp.porte
+            WHEN '01' THEN 'NAO INFORMADO'
+            WHEN '03' THEN 'MICRO EMPRESA'
+            WHEN '05' THEN 'EMPRESA DE PEQUENO PORTE'
+            ELSE 'DEMAIS'
+        END
+    ) AS porte,
+    emp.ente_federativo_responsavel,
+    named_struct(
+        'codigo', est.codigo_municipio,
+        'codigo_ibge', ibge.codigo_ibge,
+        'descricao', mun.descricao
+    ) AS municipio,
+    named_struct('codigo', est.codigo_pais, 'descricao', pae.descricao) AS pais,
+    named_struct(
+        'tipo_logradouro', est.tipo_logradouro,
+        'logradouro', est.logradouro,
+        'numero', est.numero,
+        'complemento', est.complemento,
+        'bairro', est.bairro,
+        'cep', est.cep
+    ) AS endereco,
+    est.email,
+    array_remove(
+        make_array(
+            CASE WHEN est.telefone1 IS NOT NULL AND length(est.telefone1) > 0
+                 THEN concat(coalesce(est.ddd1, ''), est.telefone1) END,
+            CASE WHEN est.telefone2 IS NOT NULL AND length(est.telefone2) > 0
+                 THEN concat(coalesce(est.ddd2, ''), est.telefone2) END
+        ), NULL
+    ) AS telefones,
+    sa.qsa,
+    CASE WHEN sim.opcao_pelo_simples_raw = 'S' THEN true
+         WHEN sim.opcao_pelo_simples_raw = 'N' THEN false
+         ELSE NULL END AS opcao_pelo_simples,
+    CASE
+        WHEN sim.data_opcao_pelo_simples_raw IS NULL
+          OR length(sim.data_opcao_pelo_simples_raw) = 0
+          OR sim.data_opcao_pelo_simples_raw = '00000000'
+        THEN NULL
+        ELSE to_date(sim.data_opcao_pelo_simples_raw, '%Y%m%d')
+    END AS data_opcao_pelo_simples,
+    CASE
+        WHEN sim.data_exclusao_do_simples_raw IS NULL
+          OR length(sim.data_exclusao_do_simples_raw) = 0
+          OR sim.data_exclusao_do_simples_raw = '00000000'
+        THEN NULL
+        ELSE to_date(sim.data_exclusao_do_simples_raw, '%Y%m%d')
+    END AS data_exclusao_do_simples,
+    CASE WHEN sim.opcao_pelo_mei_raw = 'S' THEN true
+         WHEN sim.opcao_pelo_mei_raw = 'N' THEN false
+         ELSE NULL END AS opcao_pelo_mei,
+    CASE
+        WHEN sim.data_opcao_pelo_mei_raw IS NULL
+          OR length(sim.data_opcao_pelo_mei_raw) = 0
+          OR sim.data_opcao_pelo_mei_raw = '00000000'
+        THEN NULL
+        ELSE to_date(sim.data_opcao_pelo_mei_raw, '%Y%m%d')
+    END AS data_opcao_pelo_mei,
+    CASE
+        WHEN sim.data_exclusao_do_mei_raw IS NULL
+          OR length(sim.data_exclusao_do_mei_raw) = 0
+          OR sim.data_exclusao_do_mei_raw = '00000000'
+        THEN NULL
+        ELSE to_date(sim.data_exclusao_do_mei_raw, '%Y%m%d')
+    END AS data_exclusao_do_mei
+FROM estabelecimentos est
+INNER JOIN chunk_basicos cb ON cb.cnpj_basico = est.cnpj_basico
+LEFT JOIN chunk_empresas emp ON emp.cnpj_basico = est.cnpj_basico
+LEFT JOIN cnaes cf ON cf.codigo = est.cnae_fiscal_principal
+LEFT JOIN naturezas nat ON nat.codigo = emp.natureza_juridica
+LEFT JOIN qualificacoes qr ON qr.codigo = emp.qualificacao_responsavel
+LEFT JOIN motivos mot ON mot.codigo = est.motivo_situacao_cadastral
+LEFT JOIN municipios mun ON mun.codigo = est.codigo_municipio
+LEFT JOIN paises pae ON pae.codigo = est.codigo_pais
+LEFT JOIN ibge ON ibge.codigo_tom = est.codigo_municipio
+LEFT JOIN socios_agg sa ON sa.cnpj_basico = est.cnpj_basico
+LEFT JOIN cnaes_sec_resolved csr ON csr.cnpj = concat(est.cnpj_basico, est.cnpj_ordem, est.cnpj_dv)
+LEFT JOIN chunk_simples sim ON sim.cnpj_basico = est.cnpj_basico
+WHERE est.uf = '{uf_escaped}'
+"#
+    )
+}
+
 /// Write the consolidated DataFrame as Parquet, partitioned by `uf`, under
 /// `<out_dir>/companies/uf=<UF>/...`.
 ///
@@ -537,6 +744,8 @@ pub async fn write_partitioned(df: datafusion::dataframe::DataFrame, out_dir: &P
 }
 
 pub async fn run(zip_dir: &Path, ibge_csv: &Path, out_dir: &Path) -> Result<()> {
+    use datafusion::dataframe::DataFrameWriteOptions;
+
     let tmp = tempfile::TempDir::new()?;
     let ext = tmp.path().join("ext");
     let staging = tmp.path().join("staging");
@@ -553,23 +762,40 @@ pub async fn run(zip_dir: &Path, ibge_csv: &Path, out_dir: &Path) -> Result<()> 
     spinner.set_message("Organizando arquivos por tipo");
     organize_by_kind(&ext, &staging)?;
 
-    // Crank target_partitions way up: the consolidation does GROUP BY cnpj_basico
-    // (`socios_agg` CTE) and produces a List<Struct> of qsa per group. With the
-    // default ~num_cpus partitions, each hash bucket accumulates ~50M/N groups
-    // of List<Struct> data, and Arrow's i32 list/string offsets overflow at
-    // ~2 GB cumulative. 64 partitions keep each bucket well under 2 GB.
+    // Low target_partitions + small batch_size = bounded per-task memory so the
+    // pipeline fits in ~8 GB RAM.
     let config = SessionConfig::new()
-        .with_target_partitions(64)
-        .with_batch_size(4096);
+        .with_target_partitions(4)
+        .with_batch_size(2048);
     let ctx = SessionContext::new_with_config(config);
     spinner.set_message("Registrando tabelas-fonte");
     register_sources(&ctx, &staging).await?;
     register_ibge(&ctx, ibge_csv).await?;
 
-    spinner.set_message("Consolidando (planejando query)");
-    let df = consolidate(&ctx).await?;
-    spinner.set_message(format!("Escrevendo Parquet em {}", out_dir.display()));
-    write_partitioned(df, out_dir).await?;
+    let target = out_dir.join("companies");
+    std::fs::create_dir_all(&target)?;
+    let parquet_opts = build_parquet_opts();
+    let total_jobs = BR_UFS.len() * CHUNKS_PER_UF as usize;
+    let mut done = 0_usize;
+    for uf in BR_UFS {
+        let uf_dir = target.join(format!("uf={}", uf));
+        std::fs::create_dir_all(&uf_dir)?;
+        for chunk in 0..CHUNKS_PER_UF {
+            done += 1;
+            spinner.set_message(format!(
+                "Consolidando {}/{} (UF={} chunk={})",
+                done, total_jobs, uf, chunk
+            ));
+            let sql = chunked_consolidation_sql(uf, chunk, CHUNKS_PER_UF);
+            let df = ctx.sql(&sql).await?;
+            df.write_parquet(
+                uf_dir.to_str().unwrap(),
+                DataFrameWriteOptions::new(),
+                Some(parquet_opts.clone()),
+            )
+            .await?;
+        }
+    }
     spinner.finish_with_message("Transformação concluída");
     Ok(())
 }
