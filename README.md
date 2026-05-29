@@ -194,18 +194,24 @@ minha-receita-rs sql \
 
 ## 5. Formatos de saída
 
-Todos os comandos de consulta aceitam `--format` e `--output`:
+Todos os comandos de consulta aceitam `--format` e `--output`. O formato é
+**inferido pela extensão** de `--output` (`.csv` → csv, `.json`/`.jsonl` → json),
+então normalmente você nem precisa passar `--format`. Um `--format` explícito
+sempre tem prioridade; sem `--output`, o padrão é a tabela no terminal.
 
 ```sh
 # Padrão: tabela ASCII colorida no terminal
 minha-receita-rs lookup 33683111000280
 
-# CSV pra abrir no Excel/Sheets (só com colunas escalares)
+# CSV pra abrir no Excel/Sheets — basta a extensão .csv
 minha-receita-rs sql "SELECT cnpj, razao_social, uf FROM companies LIMIT 100" \
-  --format csv --output amostra.csv
+  --output amostra.csv
 
-# JSON Lines — recomendado pra dados completos (mantém structs aninhados)
-minha-receita-rs lookup 33683111000280 --format json --output empresa.jsonl
+# JSON Lines — basta a extensão .jsonl (mantém structs aninhados)
+minha-receita-rs lookup 33683111000280 --output empresa.jsonl
+
+# Forçar um formato independente da extensão:
+minha-receita-rs lookup 33683111000280 --format json --output empresa.txt
 ```
 
 > ⚠️ **CSV não suporta colunas struct** (`cnae_fiscal`, `qsa`, `endereco`, ...).
