@@ -166,6 +166,10 @@ minha-receita-rs search --uf RJ --cnae 4711-3/01 --bairro Centro
 minha-receita-rs search --situacao ATIVA --municipio 7107 --limit 50 --page 2
 ```
 
+O `search` mostra uma visão concisa pra caber na tela (cnpj, razão social, nome
+fantasia, situação, município, UF e CNAE) — sem as colunas aninhadas. Pro
+registro completo de uma empresa, use `lookup <cnpj>`.
+
 Flags disponíveis: `--uf`, `--cnae`, `--bairro`, `--municipio`, `--natureza`,
 `--situacao`, `--limit` (default 10, máx 100), `--page` (default 1).
 

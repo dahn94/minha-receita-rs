@@ -78,6 +78,12 @@ fn normalize_cnae(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_digit()).collect()
 }
 
+/// Columns `search` projects: a flat, human-readable view that fits a terminal
+/// table and a CSV (no struct columns). The nested `municipio`/`cnae_fiscal`
+/// are flattened to their useful field. Full detail is what `lookup` is for.
+const SEARCH_COLUMNS: &str = "cnpj, razao_social, nome_fantasia, situacao_cadastral, \
+     municipio.descricao AS municipio, uf, cnae_fiscal.codigo AS cnae";
+
 /// Build the `SELECT … WHERE … LIMIT … OFFSET …` for a search. Pure (no I/O)
 /// so the clause shaping can be unit-tested without a dataset.
 fn build_search_sql(p: &SearchParams) -> String {
@@ -108,7 +114,7 @@ fn build_search_sql(p: &SearchParams) -> String {
     };
     let limit = p.limit.clamp(1, 100);
     let offset = limit.saturating_mul(p.page.max(1).saturating_sub(1));
-    format!("SELECT * FROM companies{where_sql} LIMIT {limit} OFFSET {offset}")
+    format!("SELECT {SEARCH_COLUMNS} FROM companies{where_sql} LIMIT {limit} OFFSET {offset}")
 }
 
 #[derive(Debug, Default, Clone)]
@@ -162,6 +168,18 @@ mod tests {
             ..Default::default()
         };
         assert!(build_search_sql(&p).contains("upper(endereco.bairro) = upper('Centro')"));
+    }
+
+    #[test]
+    fn projects_flat_columns_not_star() {
+        let sql = build_search_sql(&SearchParams {
+            limit: 10,
+            page: 1,
+            ..Default::default()
+        });
+        assert!(!sql.contains("SELECT *"), "search must not dump every column");
+        assert!(sql.contains("municipio.descricao AS municipio"));
+        assert!(sql.contains("cnae_fiscal.codigo AS cnae"));
     }
 
     #[test]
