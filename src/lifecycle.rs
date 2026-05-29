@@ -83,8 +83,13 @@ pub async fn update(root: &Path, concurrency: usize) -> Result<UpdateOutcome> {
     })
 }
 
+/// RFB Código TOM -> IBGE municipality mapping, bundled into the binary.
+/// Snapshot from Tesouro Transparente CKAN dataset abb968cb. Refresh if a new
+/// município gets added/renamed (rare).
+const BUNDLED_TABMUN_CSV: &str = include_str!("../assets/tabmun.csv");
+
 pub async fn init(root: &Path, period_override: Option<String>, concurrency: usize) -> Result<()> {
-    use crate::download::{RECEITA_BASE_URL, discover_and_download, download_file, fetch_ibge_url};
+    use crate::download::{RECEITA_BASE_URL, discover_and_download};
     let client = reqwest::Client::builder()
         .user_agent("minha-receita-rs/0.1")
         .build()?;
@@ -93,10 +98,14 @@ pub async fn init(root: &Path, period_override: Option<String>, concurrency: usi
     eprintln!("==> Baixando arquivos da Receita");
     let actual_period =
         discover_and_download(&client, RECEITA_BASE_URL, period, &zips, concurrency).await?;
-    eprintln!("==> Baixando tabela IBGE");
-    let ibge_url = fetch_ibge_url(&client).await?;
+
     let ibge_csv = zips.join("tabmun.csv");
-    download_file(&client, &ibge_url, &ibge_csv).await?;
+    if !ibge_csv.exists() {
+        eprintln!("==> Gravando tabela IBGE (bundled)");
+        std::fs::create_dir_all(&zips)?;
+        std::fs::write(&ibge_csv, BUNDLED_TABMUN_CSV)?;
+    }
+
     eprintln!("==> Transformando para Parquet");
     crate::transform::run(&zips, &ibge_csv, root).await?;
     std::fs::write(root.join(".period"), actual_period.to_string())?;
