@@ -553,7 +553,15 @@ pub async fn run(zip_dir: &Path, ibge_csv: &Path, out_dir: &Path) -> Result<()> 
     spinner.set_message("Organizando arquivos por tipo");
     organize_by_kind(&ext, &staging)?;
 
-    let ctx = SessionContext::new();
+    // Crank target_partitions way up: the consolidation does GROUP BY cnpj_basico
+    // (`socios_agg` CTE) and produces a List<Struct> of qsa per group. With the
+    // default ~num_cpus partitions, each hash bucket accumulates ~50M/N groups
+    // of List<Struct> data, and Arrow's i32 list/string offsets overflow at
+    // ~2 GB cumulative. 64 partitions keep each bucket well under 2 GB.
+    let config = SessionConfig::new()
+        .with_target_partitions(64)
+        .with_batch_size(4096);
+    let ctx = SessionContext::new_with_config(config);
     spinner.set_message("Registrando tabelas-fonte");
     register_sources(&ctx, &staging).await?;
     register_ibge(&ctx, ibge_csv).await?;
