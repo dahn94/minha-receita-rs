@@ -20,6 +20,18 @@ pub async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> 
     download_file_with_progress(client, url, dest, None, None).await
 }
 
+fn pending_style() -> ProgressStyle {
+    ProgressStyle::with_template("{prefix:25!} {msg}").unwrap()
+}
+
+fn active_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{prefix:25!} [{bar:30.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12} eta {eta:>4} {msg}",
+    )
+    .unwrap()
+    .progress_chars("=> ")
+}
+
 async fn download_file_with_progress(
     client: &reqwest::Client,
     url: &str,
@@ -27,6 +39,10 @@ async fn download_file_with_progress(
     auth_token: Option<&str>,
     pb: Option<&ProgressBar>,
 ) -> Result<()> {
+    if let Some(pb) = pb {
+        pb.set_style(active_style());
+        pb.set_message("");
+    }
     let head_req = client.head(url);
     let head_req = match auth_token {
         Some(tok) => head_req.basic_auth(tok, Some("")),
@@ -98,19 +114,14 @@ pub async fn download_all(
     std::fs::create_dir_all(dest_dir)?;
 
     let multi = MultiProgress::new();
-    let style = ProgressStyle::with_template(
-        "{prefix:25!} [{bar:30.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12} eta {eta:>4} {msg}",
-    )
-    .unwrap()
-    .progress_chars("=> ");
-
     let bars: Vec<ProgressBar> = urls
         .iter()
         .map(|url| {
             let name = url.rsplit('/').next().unwrap_or("file.bin").to_string();
             let pb = multi.add(ProgressBar::new(0));
-            pb.set_style(style.clone());
+            pb.set_style(pending_style());
             pb.set_prefix(name);
+            pb.set_message("aguardando");
             pb
         })
         .collect();
