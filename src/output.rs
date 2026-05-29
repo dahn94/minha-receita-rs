@@ -13,11 +13,7 @@ pub enum Format {
     Json,
 }
 
-pub fn write(
-    format: Format,
-    batches: &[RecordBatch],
-    writer: &mut dyn Write,
-) -> Result<()> {
+pub fn write(format: Format, batches: &[RecordBatch], writer: &mut dyn Write) -> Result<()> {
     match format {
         Format::Table => write_table(batches, writer),
         Format::Csv => write_csv(batches, writer),

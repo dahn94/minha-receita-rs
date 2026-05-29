@@ -33,7 +33,11 @@ pub async fn init_from_local(
     let tmp = tempfile::TempDir::new()?;
     crate::transform::extract_zip_to_dir(outer_zip, tmp.path())?;
     let inner_dir = tmp.path().join(period.to_string());
-    let source = if inner_dir.exists() { inner_dir } else { tmp.path().to_path_buf() };
+    let source = if inner_dir.exists() {
+        inner_dir
+    } else {
+        tmp.path().to_path_buf()
+    };
     for entry in std::fs::read_dir(&source)? {
         let p = entry?.path();
         if p.extension().and_then(|s| s.to_str()) == Some("zip") {
@@ -73,19 +77,21 @@ pub async fn update(root: &Path, concurrency: usize) -> Result<UpdateOutcome> {
         std::fs::remove_dir_all(&companies)?;
     }
     init(root, Some(remote.to_string()), concurrency).await?;
-    Ok(UpdateOutcome::Updated { from: local, to: remote })
+    Ok(UpdateOutcome::Updated {
+        from: local,
+        to: remote,
+    })
 }
 
 pub async fn init(root: &Path, period_override: Option<String>, concurrency: usize) -> Result<()> {
-    use crate::download::{
-        RECEITA_BASE_URL, discover_and_download, fetch_ibge_url, download_file,
-    };
+    use crate::download::{RECEITA_BASE_URL, discover_and_download, download_file, fetch_ibge_url};
     let client = reqwest::Client::builder()
         .user_agent("minha-receita-rs/0.1")
         .build()?;
     let period = period_override.map(|s| s.parse::<Period>()).transpose()?;
     let zips = root.join("zips");
-    let actual_period = discover_and_download(&client, RECEITA_BASE_URL, period, &zips, concurrency).await?;
+    let actual_period =
+        discover_and_download(&client, RECEITA_BASE_URL, period, &zips, concurrency).await?;
     let ibge_url = fetch_ibge_url(&client).await?;
     let ibge_csv = zips.join("tabmun.csv");
     download_file(&client, &ibge_url, &ibge_csv).await?;

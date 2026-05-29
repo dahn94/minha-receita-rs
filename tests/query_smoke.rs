@@ -35,7 +35,12 @@ async fn search_by_uf_returns_filtered() {
     let td = TempDir::new().unwrap();
     common::write_tiny_companies(td.path()).await;
     let ctx = DataContext::open(td.path()).await.unwrap();
-    let p = SearchParams { uf: Some("SP".into()), limit: 10, page: 1, ..Default::default() };
+    let p = SearchParams {
+        uf: Some("SP".into()),
+        limit: 10,
+        page: 1,
+        ..Default::default()
+    };
     let batches = ctx.search(&p).await.unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 }
@@ -45,7 +50,11 @@ async fn search_pagination_offsets() {
     let td = TempDir::new().unwrap();
     common::write_tiny_companies(td.path()).await;
     let ctx = DataContext::open(td.path()).await.unwrap();
-    let p = SearchParams { limit: 1, page: 2, ..Default::default() };
+    let p = SearchParams {
+        limit: 1,
+        page: 2,
+        ..Default::default()
+    };
     let batches = ctx.search(&p).await.unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
 }
@@ -55,11 +64,22 @@ async fn sql_raw_passes_through() {
     let td = TempDir::new().unwrap();
     common::write_tiny_companies(td.path()).await;
     let ctx = DataContext::open(td.path()).await.unwrap();
-    let batches = ctx.sql("SELECT uf, COUNT(*) AS n FROM companies GROUP BY uf").await.unwrap();
-    let total: i64 = batches.iter().map(|b| {
-        b.column_by_name("n").unwrap()
-            .as_any().downcast_ref::<arrow::array::Int64Array>().unwrap()
-            .iter().flatten().sum::<i64>()
-    }).sum();
+    let batches = ctx
+        .sql("SELECT uf, COUNT(*) AS n FROM companies GROUP BY uf")
+        .await
+        .unwrap();
+    let total: i64 = batches
+        .iter()
+        .map(|b| {
+            b.column_by_name("n")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .sum::<i64>()
+        })
+        .sum();
     assert_eq!(total, 2);
 }

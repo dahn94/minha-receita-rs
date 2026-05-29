@@ -15,7 +15,9 @@ pub struct Period {
 impl FromStr for Period {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self> {
-        let (y, m) = s.split_once('-').ok_or_else(|| Error::InvalidPeriod(s.into()))?;
+        let (y, m) = s
+            .split_once('-')
+            .ok_or_else(|| Error::InvalidPeriod(s.into()))?;
         let year: u16 = y.parse().map_err(|_| Error::InvalidPeriod(s.into()))?;
         let month: u8 = m.parse().map_err(|_| Error::InvalidPeriod(s.into()))?;
         if !(1..=12).contains(&month) {
@@ -69,7 +71,11 @@ fn socio() -> DataType {
         Field::new("pais", DataType::Utf8, true),
         Field::new("cpf_representante_legal", DataType::Utf8, true),
         Field::new("nome_representante_legal", DataType::Utf8, true),
-        Field::new("codigo_qualificacao_representante_legal", DataType::Int32, true),
+        Field::new(
+            "codigo_qualificacao_representante_legal",
+            DataType::Int32,
+            true,
+        ),
         Field::new("qualificacao_representante_legal", DataType::Utf8, true),
         Field::new("codigo_faixa_etaria", DataType::Int32, true),
         Field::new("faixa_etaria", DataType::Utf8, true),
@@ -131,16 +137,34 @@ mod tests {
         let s = companies_schema();
         let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
         for expected in [
-            "cnpj", "cnpj_raiz", "razao_social", "nome_fantasia",
-            "situacao_cadastral", "data_situacao_cadastral",
-            "motivo_situacao_cadastral", "data_inicio_atividade",
-            "cnae_fiscal", "cnaes_secundarios", "natureza_juridica",
-            "qualificacao_responsavel", "capital_social", "porte",
-            "ente_federativo_responsavel", "uf", "municipio", "pais",
-            "endereco", "email", "telefones", "qsa",
-            "opcao_pelo_simples", "data_opcao_pelo_simples",
-            "data_exclusao_do_simples", "opcao_pelo_mei",
-            "data_opcao_pelo_mei", "data_exclusao_do_mei",
+            "cnpj",
+            "cnpj_raiz",
+            "razao_social",
+            "nome_fantasia",
+            "situacao_cadastral",
+            "data_situacao_cadastral",
+            "motivo_situacao_cadastral",
+            "data_inicio_atividade",
+            "cnae_fiscal",
+            "cnaes_secundarios",
+            "natureza_juridica",
+            "qualificacao_responsavel",
+            "capital_social",
+            "porte",
+            "ente_federativo_responsavel",
+            "uf",
+            "municipio",
+            "pais",
+            "endereco",
+            "email",
+            "telefones",
+            "qsa",
+            "opcao_pelo_simples",
+            "data_opcao_pelo_simples",
+            "data_exclusao_do_simples",
+            "opcao_pelo_mei",
+            "data_opcao_pelo_mei",
+            "data_exclusao_do_mei",
         ] {
             assert!(names.contains(&expected), "missing field: {expected}");
         }

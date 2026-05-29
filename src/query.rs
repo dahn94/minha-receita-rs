@@ -110,7 +110,7 @@ impl DataContext {
         } else {
             format!(" WHERE {}", where_clauses.join(" AND "))
         };
-        let limit = p.limit.max(1).min(100);
+        let limit = p.limit.clamp(1, 100);
         let offset = limit.saturating_mul(p.page.max(1).saturating_sub(1));
         let sql = format!(
             "SELECT * FROM companies{} LIMIT {} OFFSET {}",

@@ -4,9 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::datasource::MemTable;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::listing::ListingOptions;
-use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
 
 use crate::Result;
@@ -79,14 +79,10 @@ pub fn raw_schema(kind: &str) -> Option<SchemaRef> {
             utf("data_opcao_pelo_mei_raw"),
             utf("data_exclusao_do_mei_raw"),
         ]),
-        "cnaes" | "motivos" | "naturezas" | "paises" | "qualificacoes" => Schema::new(vec![
-            utf("codigo"),
-            utf("descricao"),
-        ]),
-        "municipios" => Schema::new(vec![
-            utf("codigo"),
-            utf("descricao"),
-        ]),
+        "cnaes" | "motivos" | "naturezas" | "paises" | "qualificacoes" => {
+            Schema::new(vec![utf("codigo"), utf("descricao")])
+        }
+        "municipios" => Schema::new(vec![utf("codigo"), utf("descricao")]),
         _ => return None,
     };
     Some(Arc::new(schema))
@@ -94,8 +90,16 @@ pub fn raw_schema(kind: &str) -> Option<SchemaRef> {
 
 pub async fn register_sources(ctx: &SessionContext, staging: &Path) -> Result<()> {
     for kind in [
-        "empresas", "estabelecimentos", "socios", "simples",
-        "cnaes", "motivos", "naturezas", "paises", "qualificacoes", "municipios",
+        "empresas",
+        "estabelecimentos",
+        "socios",
+        "simples",
+        "cnaes",
+        "motivos",
+        "naturezas",
+        "paises",
+        "qualificacoes",
+        "municipios",
     ] {
         let dir = staging.join(kind);
         if !dir.exists() {
@@ -105,8 +109,7 @@ pub async fn register_sources(ctx: &SessionContext, staging: &Path) -> Result<()
         let fmt = CsvFormat::default()
             .with_has_header(false)
             .with_delimiter(b';');
-        let opts = ListingOptions::new(Arc::new(fmt))
-            .with_file_extension(".csv");
+        let opts = ListingOptions::new(Arc::new(fmt)).with_file_extension(".csv");
         ctx.register_listing_table(kind, dir.to_str().unwrap(), opts, Some(schema), None)
             .await?;
     }
@@ -133,13 +136,12 @@ pub async fn register_ibge(ctx: &SessionContext, csv_path: &Path) -> Result<()> 
                 .schema(raw_schema.as_ref()),
         )
         .await?;
-    let projected = df
-        .select(vec![
-            col("codigo_tom"),
-            trim(vec![col("nome")]).alias("nome"),
-            trim(vec![col("uf")]).alias("uf"),
-            trim(vec![col("codigo_ibge")]).alias("codigo_ibge"),
-        ])?;
+    let projected = df.select(vec![
+        col("codigo_tom"),
+        trim(vec![col("nome")]).alias("nome"),
+        trim(vec![col("uf")]).alias("uf"),
+        trim(vec![col("codigo_ibge")]).alias("codigo_ibge"),
+    ])?;
     let final_schema = Arc::new(Schema::new(vec![
         Field::new("codigo_tom", DataType::Utf8, true),
         Field::new("nome", DataType::Utf8, true),
@@ -441,10 +443,7 @@ pub async fn consolidate(ctx: &SessionContext) -> Result<datafusion::dataframe::
 ///   support sorting on struct columns at planning, so we drop `with_sort_by`
 ///   entirely. The partition-by alone satisfies the column-store layout
 ///   requirements; sorting was only a downstream-query optimization.
-pub async fn write_partitioned(
-    df: datafusion::dataframe::DataFrame,
-    out_dir: &Path,
-) -> Result<()> {
+pub async fn write_partitioned(df: datafusion::dataframe::DataFrame, out_dir: &Path) -> Result<()> {
     use datafusion::common::config::{ParquetColumnOptions, TableParquetOptions};
     use datafusion::dataframe::DataFrameWriteOptions;
 
@@ -542,14 +541,20 @@ mod tests {
     #[test]
     fn classifies_real_receita_names() {
         assert_eq!(classify("K3241.K03200Y0.D10110.EMPRECSV"), Some("empresas"));
-        assert_eq!(classify("K3241.K03200Y0.D10110.ESTABELE"), Some("estabelecimentos"));
+        assert_eq!(
+            classify("K3241.K03200Y0.D10110.ESTABELE"),
+            Some("estabelecimentos")
+        );
         assert_eq!(classify("K3241.K03200Y0.D10110.SOCIOCSV"), Some("socios"));
         assert_eq!(classify("F.K03200$Z.D10110.CNAECSV"), Some("cnaes"));
         assert_eq!(classify("F.K03200$Z.D10110.MUNICCSV"), Some("municipios"));
         assert_eq!(classify("F.K03200$Z.D10110.NATJUCSV"), Some("naturezas"));
         assert_eq!(classify("F.K03200$Z.D10110.PAISCSV"), Some("paises"));
         assert_eq!(classify("F.K03200$Z.D10110.MOTICSV"), Some("motivos"));
-        assert_eq!(classify("F.K03200$Z.D10110.QUALSCSV"), Some("qualificacoes"));
+        assert_eq!(
+            classify("F.K03200$Z.D10110.QUALSCSV"),
+            Some("qualificacoes")
+        );
         assert_eq!(classify("D10110.SIMPLES.CSV.D10110"), Some("simples"));
         assert_eq!(classify("ignore.txt"), None);
     }
@@ -591,13 +596,24 @@ mod tests {
         let td = tempfile::TempDir::new().unwrap();
         let staging = td.path().join("staging").join("cnaes");
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("Cnaes.csv"), "0111-3/01;Cultivo de arroz\n0111-3/02;Cultivo de milho\n").unwrap();
+        std::fs::write(
+            staging.join("Cnaes.csv"),
+            "0111-3/01;Cultivo de arroz\n0111-3/02;Cultivo de milho\n",
+        )
+        .unwrap();
 
         let ctx = datafusion::prelude::SessionContext::new();
-        register_sources(&ctx, td.path().join("staging").as_path()).await.unwrap();
+        register_sources(&ctx, td.path().join("staging").as_path())
+            .await
+            .unwrap();
         let df = ctx.sql("SELECT COUNT(*) as n FROM cnaes").await.unwrap();
         let b = df.collect().await.unwrap();
-        let n = b[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
+        let n = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
         assert_eq!(n, 2);
     }
 
@@ -606,14 +622,31 @@ mod tests {
         let td = tempfile::TempDir::new().unwrap();
         let csv = td.path().join("tabmun.csv");
         // Real wire format: 5 columns, no header, with padded names.
-        std::fs::write(&csv, "7107;26994533000120;SAO PAULO                                     ;SP;3550308\n").unwrap();
+        std::fs::write(
+            &csv,
+            "7107;26994533000120;SAO PAULO                                     ;SP;3550308\n",
+        )
+        .unwrap();
 
         let ctx = datafusion::prelude::SessionContext::new();
         register_ibge(&ctx, &csv).await.unwrap();
-        let df = ctx.sql("SELECT codigo_ibge, nome FROM ibge WHERE codigo_tom = '7107'").await.unwrap();
+        let df = ctx
+            .sql("SELECT codigo_ibge, nome FROM ibge WHERE codigo_tom = '7107'")
+            .await
+            .unwrap();
         let b = df.collect().await.unwrap();
-        let ibge = b[0].column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap().value(0);
-        let nome = b[0].column(1).as_any().downcast_ref::<arrow::array::StringArray>().unwrap().value(0);
+        let ibge = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
+        let nome = b[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
         assert_eq!(ibge, "3550308");
         assert_eq!(nome, "SAO PAULO");
     }
@@ -622,7 +655,8 @@ mod tests {
     async fn consolidates_testdata() {
         let td = tempfile::TempDir::new().unwrap();
         let zip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata").join("2026-01.zip");
+            .join("testdata")
+            .join("2026-01.zip");
         let ext_outer = td.path().join("outer");
         extract_zip_to_dir(&zip, &ext_outer).unwrap();
         let inner_dir = if ext_outer.join("2026-01").exists() {
@@ -643,7 +677,8 @@ mod tests {
         let ctx = datafusion::prelude::SessionContext::new();
         register_sources(&ctx, &staging).await.unwrap();
         let ibge_csv = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata").join("tabmun.csv");
+            .join("testdata")
+            .join("tabmun.csv");
         register_ibge(&ctx, &ibge_csv).await.unwrap();
 
         let df = consolidate(&ctx).await.unwrap();
@@ -666,10 +701,14 @@ mod tests {
             Field::new("cnpj", DataType::Utf8, false),
             Field::new("uf", DataType::Utf8, false),
         ]));
-        let batch = arrow::array::RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
-            Arc::new(arrow::array::StringArray::from(vec!["SP", "SP", "RJ"])),
-        ]).unwrap();
+        let batch = arrow::array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(arrow::array::StringArray::from(vec!["SP", "SP", "RJ"])),
+            ],
+        )
+        .unwrap();
         let df = ctx.read_batch(batch).unwrap();
 
         let td = tempfile::TempDir::new().unwrap();
@@ -688,7 +727,11 @@ mod tests {
         std::fs::create_dir_all(&in_dir).unwrap();
         let outer = td.path().join("outer");
         extract_zip_to_dir(&testdata.join("2026-01.zip"), &outer).unwrap();
-        let inner_src = if outer.join("2026-01").exists() { outer.join("2026-01") } else { outer.clone() };
+        let inner_src = if outer.join("2026-01").exists() {
+            outer.join("2026-01")
+        } else {
+            outer.clone()
+        };
         for entry in std::fs::read_dir(&inner_src).unwrap() {
             let p = entry.unwrap().path();
             if p.extension().and_then(|s| s.to_str()) == Some("zip") {
@@ -697,7 +740,9 @@ mod tests {
         }
 
         let out = td.path().join("parquet");
-        run(&in_dir, &testdata.join("tabmun.csv"), &out).await.unwrap();
+        run(&in_dir, &testdata.join("tabmun.csv"), &out)
+            .await
+            .unwrap();
 
         assert!(out.join("companies").exists());
         let count = walkdir(&out.join("companies"))
@@ -713,7 +758,11 @@ mod tests {
                 let rd = std::fs::read_dir(&d).ok()?;
                 for e in rd.flatten() {
                     let p = e.path();
-                    if p.is_dir() { stack.push(p); } else { return Some(p); }
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else {
+                        return Some(p);
+                    }
                 }
             }
             None

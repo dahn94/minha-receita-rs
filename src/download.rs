@@ -18,11 +18,10 @@ pub async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> 
             .get(reqwest::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
+            && local_len == remote_len
         {
-            if local_len == remote_len {
-                tracing::info!(file=%dest.display(), "already complete, skipping");
-                return Ok(());
-            }
+            tracing::info!(file=%dest.display(), "already complete, skipping");
+            return Ok(());
         }
     }
     if let Some(parent) = dest.parent() {
@@ -31,7 +30,10 @@ pub async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> 
     let resp = client.get(url).send().await?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(Error::Http { url: url.into(), status: status.as_u16() });
+        return Err(Error::Http {
+            url: url.into(),
+            status: status.as_u16(),
+        });
     }
     let mut file = tokio::fs::File::create(dest).await?;
     let mut stream = resp.bytes_stream();
@@ -66,15 +68,23 @@ pub async fn download_all(
 }
 
 #[derive(Deserialize)]
-struct CkanPkg { result: CkanResult }
+struct CkanPkg {
+    result: CkanResult,
+}
 #[derive(Deserialize)]
-struct CkanResult { resources: Vec<CkanResource> }
+struct CkanResult {
+    resources: Vec<CkanResource>,
+}
 #[derive(Deserialize)]
-struct CkanResource { url: String }
+struct CkanResource {
+    url: String,
+}
 
 pub fn parse_ibge_ckan(json: &str) -> Result<String> {
     let pkg: CkanPkg = serde_json::from_str(json)?;
-    pkg.result.resources.into_iter()
+    pkg.result
+        .resources
+        .into_iter()
         .find(|r| r.url.to_lowercase().ends_with(".csv"))
         .map(|r| r.url)
         .ok_or_else(|| Error::MissingData("no CSV resource in CKAN response".into()))
@@ -117,11 +127,27 @@ pub async fn discover_and_download(
     let period = if let Some(p) = period_override {
         p
     } else {
-        let html = client.get(base_url).send().await?.error_for_status()?.text().await?;
+        let html = client
+            .get(base_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
         latest_period(&html)?
     };
-    let period_url = format!("{}{}/", base_url.trim_end_matches('/'), &format!("/{}", period));
-    let html = client.get(&period_url).send().await?.error_for_status()?.text().await?;
+    let period_url = format!(
+        "{}{}/",
+        base_url.trim_end_matches('/'),
+        &format!("/{}", period)
+    );
+    let html = client
+        .get(&period_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     let names = parse_file_listing(&html);
     let urls: Vec<String> = names.iter().map(|n| format!("{period_url}{n}")).collect();
     download_all(client, &urls, dest_dir, concurrency).await?;
@@ -129,13 +155,25 @@ pub async fn discover_and_download(
 }
 
 pub async fn fetch_latest_period(client: &reqwest::Client, base_url: &str) -> Result<Period> {
-    let html = client.get(base_url).send().await?.error_for_status()?.text().await?;
+    let html = client
+        .get(base_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     latest_period(&html)
 }
 
 pub async fn fetch_ibge_url(client: &reqwest::Client) -> Result<String> {
     const CKAN: &str = "https://www.tesourotransparente.gov.br/ckan/api/3/action/package_show?id=abb968cb-3710-4f85-89cf-875c91b9c7f6";
-    let body = client.get(CKAN).send().await?.error_for_status()?.text().await?;
+    let body = client
+        .get(CKAN)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     parse_ibge_ckan(&body)
 }
 
@@ -210,16 +248,20 @@ mod tests {
     #[tokio::test]
     async fn downloads_a_file() {
         let mut server = mockito::Server::new_async().await;
-        let m = server.mock("GET", "/file.zip")
+        let m = server
+            .mock("GET", "/file.zip")
             .with_status(200)
             .with_body("hello-bytes")
             .with_header("content-length", "11")
-            .create_async().await;
+            .create_async()
+            .await;
 
         let td = tempfile::TempDir::new().unwrap();
         let dest = td.path().join("file.zip");
         let client = reqwest::Client::new();
-        download_file(&client, &format!("{}/file.zip", server.url()), &dest).await.unwrap();
+        download_file(&client, &format!("{}/file.zip", server.url()), &dest)
+            .await
+            .unwrap();
 
         let got = std::fs::read_to_string(&dest).unwrap();
         assert_eq!(got, "hello-bytes");
@@ -234,13 +276,17 @@ mod tests {
 
         let mut server = mockito::Server::new_async().await;
         // Espera-se nenhum GET — só HEAD com content-length.
-        let m_head = server.mock("HEAD", "/file.zip")
+        let m_head = server
+            .mock("HEAD", "/file.zip")
             .with_status(200)
             .with_header("content-length", "11")
-            .create_async().await;
+            .create_async()
+            .await;
 
         let client = reqwest::Client::new();
-        download_file(&client, &format!("{}/file.zip", server.url()), &dest).await.unwrap();
+        download_file(&client, &format!("{}/file.zip", server.url()), &dest)
+            .await
+            .unwrap();
         m_head.assert_async().await;
     }
 
@@ -248,40 +294,72 @@ mod tests {
     async fn discover_and_download_full_flow() {
         let mut server = mockito::Server::new_async().await;
         // Listing raiz
-        let _root = server.mock("GET", "/dados_abertos_cnpj/")
+        let _root = server
+            .mock("GET", "/dados_abertos_cnpj/")
             .with_body(r#"<a href="2026-04/">2026-04/</a>"#)
-            .create_async().await;
-        let _period_dir = server.mock("GET", "/dados_abertos_cnpj/2026-04/")
+            .create_async()
+            .await;
+        let _period_dir = server
+            .mock("GET", "/dados_abertos_cnpj/2026-04/")
             .with_body(r#"<a href="Cnaes.zip">Cnaes.zip</a>"#)
-            .create_async().await;
-        let _file = server.mock("GET", "/dados_abertos_cnpj/2026-04/Cnaes.zip")
-            .with_status(200).with_body("XX").with_header("content-length", "2")
-            .create_async().await;
+            .create_async()
+            .await;
+        let _file = server
+            .mock("GET", "/dados_abertos_cnpj/2026-04/Cnaes.zip")
+            .with_status(200)
+            .with_body("XX")
+            .with_header("content-length", "2")
+            .create_async()
+            .await;
 
         let td = tempfile::TempDir::new().unwrap();
         let client = reqwest::Client::new();
         let base = format!("{}/dados_abertos_cnpj/", server.url());
-        let period = discover_and_download(&client, &base, None, td.path(), 2).await.unwrap();
+        let period = discover_and_download(&client, &base, None, td.path(), 2)
+            .await
+            .unwrap();
 
         assert_eq!(period.to_string(), "2026-04");
-        assert_eq!(std::fs::read_to_string(td.path().join("Cnaes.zip")).unwrap(), "XX");
+        assert_eq!(
+            std::fs::read_to_string(td.path().join("Cnaes.zip")).unwrap(),
+            "XX"
+        );
     }
 
     #[tokio::test]
     async fn parallel_orchestrator_downloads_all() {
         let mut server = mockito::Server::new_async().await;
-        let m1 = server.mock("GET", "/a.zip").with_status(200).with_body("aaa")
-            .with_header("content-length", "3").create_async().await;
-        let m2 = server.mock("GET", "/b.zip").with_status(200).with_body("bbbb")
-            .with_header("content-length", "4").create_async().await;
+        let m1 = server
+            .mock("GET", "/a.zip")
+            .with_status(200)
+            .with_body("aaa")
+            .with_header("content-length", "3")
+            .create_async()
+            .await;
+        let m2 = server
+            .mock("GET", "/b.zip")
+            .with_status(200)
+            .with_body("bbbb")
+            .with_header("content-length", "4")
+            .create_async()
+            .await;
 
         let td = tempfile::TempDir::new().unwrap();
         let client = reqwest::Client::new();
-        let urls = vec![format!("{}/a.zip", server.url()), format!("{}/b.zip", server.url())];
+        let urls = vec![
+            format!("{}/a.zip", server.url()),
+            format!("{}/b.zip", server.url()),
+        ];
         download_all(&client, &urls, td.path(), 2).await.unwrap();
 
-        assert_eq!(std::fs::read_to_string(td.path().join("a.zip")).unwrap(), "aaa");
-        assert_eq!(std::fs::read_to_string(td.path().join("b.zip")).unwrap(), "bbbb");
+        assert_eq!(
+            std::fs::read_to_string(td.path().join("a.zip")).unwrap(),
+            "aaa"
+        );
+        assert_eq!(
+            std::fs::read_to_string(td.path().join("b.zip")).unwrap(),
+            "bbbb"
+        );
         m1.assert_async().await;
         m2.assert_async().await;
     }
