@@ -13,6 +13,26 @@ pub enum Format {
     Json,
 }
 
+/// Resolve which format to use. An explicit `--format` always wins; otherwise
+/// infer from the `--output` file extension (`.csv` → CSV, `.json`/`.jsonl`/
+/// `.ndjson` → JSON), falling back to the terminal table. This keeps
+/// `--output amostra.csv` from silently writing an ASCII table into a `.csv`.
+pub fn resolve_format(explicit: Option<Format>, output: Option<&std::path::Path>) -> Format {
+    if let Some(f) = explicit {
+        return f;
+    }
+    match output
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("csv") => Format::Csv,
+        Some("json" | "jsonl" | "ndjson") => Format::Json,
+        _ => Format::Table,
+    }
+}
+
 pub fn write(format: Format, batches: &[RecordBatch], writer: &mut dyn Write) -> Result<()> {
     match format {
         Format::Table => write_table(batches, writer),
@@ -95,6 +115,23 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn resolve_format_infers_from_extension() {
+        use std::path::Path;
+        // Explicit format always wins.
+        assert_eq!(
+            resolve_format(Some(Format::Table), Some(Path::new("x.csv"))),
+            Format::Table
+        );
+        // Inference by extension when no explicit format.
+        assert_eq!(resolve_format(None, Some(Path::new("amostra.csv"))), Format::Csv);
+        assert_eq!(resolve_format(None, Some(Path::new("out.JSON"))), Format::Json);
+        assert_eq!(resolve_format(None, Some(Path::new("out.jsonl"))), Format::Json);
+        // Unknown extension or no output → table.
+        assert_eq!(resolve_format(None, Some(Path::new("out.txt"))), Format::Table);
+        assert_eq!(resolve_format(None, None), Format::Table);
     }
 
     #[test]

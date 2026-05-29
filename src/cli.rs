@@ -88,8 +88,10 @@ pub enum Command {
 pub struct QueryFlags {
     #[arg(long, env = "MR_DATA")]
     pub data: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t = Format::Table)]
-    pub format: Format,
+    /// Formato de saída. Se omitido, é inferido da extensão de `--output`
+    /// (`.csv` → csv, `.json`/`.jsonl` → json), senão `table`.
+    #[arg(long, value_enum)]
+    pub format: Option<Format>,
     #[arg(long)]
     pub output: Option<PathBuf>,
 }
@@ -155,11 +157,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let data = query.data.unwrap_or_else(crate::lifecycle::default_root);
             let ctx = DataContext::open(&data).await?;
             let batches = ctx.lookup(&cnpj).await?;
+            let fmt = output::resolve_format(query.format, query.output.as_deref());
             let mut out: Box<dyn io::Write> = match query.output {
                 Some(p) => Box::new(std::fs::File::create(p)?),
                 None => Box::new(io::stdout()),
             };
-            output::write(query.format, &batches, &mut *out)?;
+            output::write(fmt, &batches, &mut *out)?;
         }
         Command::Search {
             uf,
@@ -185,21 +188,23 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 page,
             };
             let batches = ctx.search(&params).await?;
+            let fmt = output::resolve_format(query.format, query.output.as_deref());
             let mut out: Box<dyn io::Write> = match query.output {
                 Some(p) => Box::new(std::fs::File::create(p)?),
                 None => Box::new(io::stdout()),
             };
-            output::write(query.format, &batches, &mut *out)?;
+            output::write(fmt, &batches, &mut *out)?;
         }
         Command::Sql { query, flags } => {
             let data = flags.data.unwrap_or_else(crate::lifecycle::default_root);
             let ctx = DataContext::open(&data).await?;
             let batches = ctx.sql(&query).await?;
+            let fmt = output::resolve_format(flags.format, flags.output.as_deref());
             let mut out: Box<dyn io::Write> = match flags.output {
                 Some(p) => Box::new(std::fs::File::create(p)?),
                 None => Box::new(io::stdout()),
             };
-            output::write(flags.format, &batches, &mut *out)?;
+            output::write(fmt, &batches, &mut *out)?;
         }
     }
     Ok(())
