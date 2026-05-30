@@ -38,7 +38,6 @@ async fn search_by_uf_returns_filtered() {
     let p = SearchParams {
         uf: Some("SP".into()),
         limit: 10,
-        page: 1,
         ..Default::default()
     };
     let batches = ctx.search(&p).await.unwrap();
@@ -46,17 +45,30 @@ async fn search_by_uf_returns_filtered() {
 }
 
 #[tokio::test]
-async fn search_pagination_offsets() {
+async fn search_limit_caps_rows() {
     let td = TempDir::new().unwrap();
     common::write_tiny_companies(td.path()).await;
     let ctx = DataContext::open(td.path()).await.unwrap();
     let p = SearchParams {
         limit: 1,
-        page: 2,
         ..Default::default()
     };
     let batches = ctx.search(&p).await.unwrap();
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+}
+
+#[tokio::test]
+async fn search_all_returns_everything() {
+    let td = TempDir::new().unwrap();
+    common::write_tiny_companies(td.path()).await;
+    let ctx = DataContext::open(td.path()).await.unwrap();
+    let p = SearchParams {
+        all: true,
+        limit: 1, // ignored when all = true
+        ..Default::default()
+    };
+    let batches = ctx.search(&p).await.unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
 }
 
 #[tokio::test]

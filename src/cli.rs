@@ -71,8 +71,9 @@ pub enum Command {
         situacao: Option<String>,
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        #[arg(long, default_value_t = 1)]
-        page: usize,
+        /// Retorna todos os resultados, ignorando --limit.
+        #[arg(long)]
+        all: bool,
         #[command(flatten)]
         query: QueryFlags,
     },
@@ -172,7 +173,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             natureza,
             situacao,
             limit,
-            page,
+            all,
             query,
         } => {
             let data = query.data.unwrap_or_else(crate::lifecycle::default_root);
@@ -185,7 +186,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 natureza,
                 situacao,
                 limit,
-                page,
+                all,
             };
             let batches = ctx.search(&params).await?;
             let fmt = output::resolve_format(query.format, query.output.as_deref());

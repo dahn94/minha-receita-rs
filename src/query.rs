@@ -112,9 +112,13 @@ fn build_search_sql(p: &SearchParams) -> String {
     } else {
         format!(" WHERE {}", where_clauses.join(" AND "))
     };
+    // `--all` returns every match; otherwise cap at `--limit` (≤100) to keep
+    // terminal output sane. Use `--all` (or the `sql` command) for everything.
+    if p.all {
+        return format!("SELECT {SEARCH_COLUMNS} FROM companies{where_sql}");
+    }
     let limit = p.limit.clamp(1, 100);
-    let offset = limit.saturating_mul(p.page.max(1).saturating_sub(1));
-    format!("SELECT {SEARCH_COLUMNS} FROM companies{where_sql} LIMIT {limit} OFFSET {offset}")
+    format!("SELECT {SEARCH_COLUMNS} FROM companies{where_sql} LIMIT {limit}")
 }
 
 #[derive(Debug, Default, Clone)]
@@ -126,7 +130,8 @@ pub struct SearchParams {
     pub natureza: Option<String>,
     pub situacao: Option<String>,
     pub limit: usize,
-    pub page: usize,
+    /// Return every match, ignoring `limit`.
+    pub all: bool,
 }
 
 impl DataContext {
@@ -153,7 +158,6 @@ mod tests {
         let p = SearchParams {
             cnae: Some("4711-3/01".into()),
             limit: 10,
-            page: 1,
             ..Default::default()
         };
         assert!(build_search_sql(&p).contains("cnae_fiscal.codigo = '4711301'"));
@@ -164,7 +168,6 @@ mod tests {
         let p = SearchParams {
             bairro: Some("Centro".into()),
             limit: 10,
-            page: 1,
             ..Default::default()
         };
         assert!(build_search_sql(&p).contains("upper(endereco.bairro) = upper('Centro')"));
@@ -174,7 +177,6 @@ mod tests {
     fn projects_flat_columns_not_star() {
         let sql = build_search_sql(&SearchParams {
             limit: 10,
-            page: 1,
             ..Default::default()
         });
         assert!(!sql.contains("SELECT *"), "search must not dump every column");
@@ -183,13 +185,24 @@ mod tests {
     }
 
     #[test]
-    fn pagination_translates_to_offset() {
+    fn all_drops_limit() {
+        let sql = build_search_sql(&SearchParams {
+            uf: Some("RJ".into()),
+            all: true,
+            limit: 10,
+            ..Default::default()
+        });
+        assert!(!sql.contains("LIMIT"), "--all must not limit: {sql}");
+        assert!(sql.contains("WHERE uf = 'RJ'"));
+    }
+
+    #[test]
+    fn limit_is_capped_at_100() {
         let p = SearchParams {
-            limit: 25,
-            page: 3,
+            limit: 250,
             ..Default::default()
         };
-        assert!(build_search_sql(&p).contains("LIMIT 25 OFFSET 50"));
+        assert!(build_search_sql(&p).contains("LIMIT 100"));
     }
 
     #[test]
@@ -197,7 +210,6 @@ mod tests {
         let p = SearchParams {
             bairro: Some("D'OESTE".into()),
             limit: 10,
-            page: 1,
             ..Default::default()
         };
         assert!(build_search_sql(&p).contains("upper('D''OESTE')"));
