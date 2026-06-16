@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray, StructArray};
+use arrow::array::{ArrayRef, ListBuilder, RecordBatch, StringArray, StringBuilder, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use minha_receita_rs::schema::companies_schema;
 
@@ -32,6 +32,11 @@ pub async fn write_tiny_companies(base: &Path) {
         Field::new("cnae_fiscal", DataType::Struct(cnae_fields.clone()), true),
         Field::new("uf", DataType::Utf8, false),
         Field::new("municipio", DataType::Struct(mun_fields.clone()), true),
+        Field::new(
+            "telefones",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
     ]));
 
     let cnae_fiscal = StructArray::new(
@@ -52,6 +57,15 @@ pub async fn write_tiny_companies(base: &Path) {
         None,
     );
 
+    let mut telefones_builder = ListBuilder::new(StringBuilder::new());
+    // Row 0: two numbers; row 1: a single number.
+    telefones_builder.values().append_value("1133334444");
+    telefones_builder.values().append_value("1199998888");
+    telefones_builder.append(true);
+    telefones_builder.values().append_value("2122223333");
+    telefones_builder.append(true);
+    let telefones = telefones_builder.finish();
+
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -62,6 +76,7 @@ pub async fn write_tiny_companies(base: &Path) {
             Arc::new(cnae_fiscal),
             Arc::new(StringArray::from(vec!["SP", "RJ"])),
             Arc::new(municipio),
+            Arc::new(telefones),
         ],
     )
     .unwrap();

@@ -82,7 +82,8 @@ fn normalize_cnae(s: &str) -> String {
 /// table and a CSV (no struct columns). The nested `municipio`/`cnae_fiscal`
 /// are flattened to their useful field. Full detail is what `lookup` is for.
 const SEARCH_COLUMNS: &str = "cnpj, razao_social, nome_fantasia, situacao_cadastral, \
-     municipio.descricao AS municipio, uf, cnae_fiscal.codigo AS cnae";
+     municipio.descricao AS municipio, uf, cnae_fiscal.codigo AS cnae, \
+     array_to_string(telefones, '; ') AS telefones";
 
 /// Build the `SELECT … WHERE … LIMIT … OFFSET …` for a search. Pure (no I/O)
 /// so the clause shaping can be unit-tested without a dataset.
@@ -182,6 +183,7 @@ mod tests {
         assert!(!sql.contains("SELECT *"), "search must not dump every column");
         assert!(sql.contains("municipio.descricao AS municipio"));
         assert!(sql.contains("cnae_fiscal.codigo AS cnae"));
+        assert!(sql.contains("array_to_string(telefones, '; ') AS telefones"));
     }
 
     #[test]
